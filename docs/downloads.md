@@ -308,7 +308,9 @@ Sideloaded builds do not update themselves, so download a newer APK to upgrade.
     (`adb uninstall org.geolibre.app`) before switching between them.
 
 Tools that need a local desktop process — the Raster, Conversion, and AI
-Segmentation toolboxes, and the PostgreSQL data source — are hidden on Android.
+Segmentation toolboxes, and the SQL Server data source — are hidden on Android.
+PostgreSQL/PostGIS layers load as read-only vector tiles rendered by the
+database, without the Martin tile server.
 The Whitebox geoprocessing toolbox runs on WebAssembly and stays available. See
 [Android](android.md) for the full list and for build instructions.
 

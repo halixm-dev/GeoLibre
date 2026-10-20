@@ -25,6 +25,7 @@ import {
 import { IS_MAS_BUILD } from "../../../../lib/build-flags";
 import { ignoreSidecarStartError, startGeoLibreSidecar } from "../../../../lib/sidecar";
 import { isDesktopRuntime } from "../../../../lib/is-mobile";
+import { isTauri } from "../../../../lib/is-tauri";
 import {
   createBaseLayer,
   errorMessage,
@@ -35,6 +36,7 @@ import {
 import { AddDataSourceForm, useAddDataSource } from "../shared";
 import { martinSourceMatchesTable } from "../martin-source-match";
 import type { OpenAddDataPostgres } from "../open-add-data";
+import { PostgresNativeSource } from "./PostgresNativeSource";
 
 type PostgresLoadMode = "tiles" | "editable";
 
@@ -43,7 +45,16 @@ interface PostgresSourceProps {
   initialPostgres?: OpenAddDataPostgres;
 }
 
-export function PostgresSource({ initialPostgres }: PostgresSourceProps) {
+export function PostgresSource(props: PostgresSourceProps) {
+  // The mobile apps are Tauri but cannot spawn Martin or the sidecar; they
+  // render tiles in-process instead (GeoLibre#2091). The web build and the
+  // desktop shell keep the Martin/sidecar flow below. The user agent is stable
+  // for the session, so evaluate once.
+  const nativeTiles = useMemo(() => isTauri() && !isDesktopRuntime(), []);
+  return nativeTiles ? <PostgresNativeSource {...props} /> : <PostgresMartinSource {...props} />;
+}
+
+function PostgresMartinSource({ initialPostgres }: PostgresSourceProps) {
   const { t } = useTranslation();
   const source = useAddDataSource(t("addData.postgres.defaultName"));
   const { martin } = source.shell;

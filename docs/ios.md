@@ -50,19 +50,27 @@ spawning subprocesses:
   submenu keeps only the client-side **Download Global DEM** tool). The Whitebox
   geoprocessing toolbox runs in WebAssembly, needs no sidecar, and stays
   available.
-- Add Data → **PostgreSQL** (served by the local Martin tile server) and
-  **SQL Server**
+- Add Data → **SQL Server**
 
 These are gated by a user-agent `isMobile()` check (which already matches
 iPhone/iPad), so the Processing menu, the Add Data menu, and the Layer panel's
 add-data group never offer them. Everything else runs client-side.
 
+Add Data → **PostgreSQL** works differently on mobile. The app cannot launch
+the Martin tile server, so the database renders the vector tiles itself
+(`ST_AsMVT`, PostGIS 3.0 or later) and the app fetches them over a direct
+PostgreSQL connection. The database server must therefore be reachable from
+the device's network. Mobile layers are read-only: the editable mode needs the
+desktop app's Python sidecar.
+
 The database sources have one entry point that check does not cover: the Browser
 panel keeps its **Databases** section on every platform for discovery, so its ＋
-still opens the connection dialog. The dialogs gate on `isDesktopRuntime()`
-(`isTauri() && !isMobile()`) rather than on `isTauri()` alone, so on iOS they
-show the "requires GeoLibre Desktop" notice and disable Connect instead of
-calling a helper that cannot exist (GeoLibre#2091).
+still opens the connection dialog. The SQL Server dialog gates on
+`isDesktopRuntime()` (`isTauri() && !isMobile()`) rather than on `isTauri()`
+alone, so on iOS it shows the "requires GeoLibre Desktop" notice and disables
+Connect instead of calling a helper that cannot exist (GeoLibre#2091). The
+PostgreSQL dialog opens its mobile form instead. Expanding a saved PostgreSQL
+connection in the Browser panel to list its tables still needs the desktop app.
 
 Unlike Android, the App Store build also hides **Earth Engine**: signing in from
 the packaged app needs a loopback OAuth listener, which the Apple App Store

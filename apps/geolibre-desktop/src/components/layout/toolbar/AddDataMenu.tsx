@@ -13,6 +13,7 @@ import { Fragment, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import type { AddDataKind } from "../AddDataDialog";
 import { isMobile } from "../../../lib/is-mobile";
+import { isTauri } from "../../../lib/is-tauri";
 import { masHidesDataSource } from "../../../lib/mas-build";
 import { useDesktopSettingsStore } from "../../../hooks/useDesktopSettings";
 import { useMapCapabilities } from "../../../hooks/useMapCapabilities";
@@ -63,10 +64,13 @@ export function AddDataMenu({
   const uiProfile = useDesktopSettingsStore((state) => state.desktopSettings.uiProfile);
   const capabilities = useMapCapabilities();
   const renderer = useAppStore((state) => state.primaryRenderer);
-  // PostgreSQL layers are served through the Martin tile server, a local helper
-  // binary with no Android build, so hide the source on mobile.
-  // The user agent is stable for the session, so evaluate once.
+  // The database sources need a native shell: on desktop PostgreSQL runs
+  // through the Martin tile server, and the mobile apps render PostGIS tiles
+  // in-process instead (lib/postgis-tiles.ts). A mobile *browser* has neither,
+  // and SQL Server has no mobile path yet. The user agent is stable for the
+  // session, so evaluate once.
   const mobile = useMemo(() => isMobile(), []);
+  const mobileWithoutNativeShell = useMemo(() => mobile && !isTauri(), [mobile]);
 
   // Map each catalog id to its dispatch. Kept here (not in the catalog) so the
   // handlers stay in scope; the catalog only owns ids, sections, and tiers.
@@ -148,7 +152,8 @@ export function AddDataMenu({
       (entry) =>
         entry.section === section &&
         isDataSourceVisible(uiProfile, entry.id) &&
-        !((entry.id === "postgres" || entry.id === "mssql") && mobile) &&
+        !(entry.id === "postgres" && mobileWithoutNativeShell) &&
+        !(entry.id === "mssql" && mobile) &&
         !masHidesDataSource(entry.id),
     ),
   })).filter((group) => group.entries.length > 0);

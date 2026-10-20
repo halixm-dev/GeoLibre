@@ -62,6 +62,10 @@ mod native_duckdb {
 compile_error!("the `mas` (Mac App Store) build must not enable `native-duckdb`: DuckDB loads its spatial extension as unsigned native code at runtime, which App Sandbox and App Store guideline 2.5.2 forbid.");
 
 mod http_body;
+// In-process PostGIS vector tiles (ST_AsMVT) for Android/iOS, which cannot run
+// the Martin tile server (GeoLibre#2091). Outbound connections only: no
+// listening socket and no spawned process, so every build target can carry it.
+mod postgis_tiles;
 // OS credential store (macOS Keychain, Windows Credential Manager, Linux Secret
 // Service) for tokens and API keys saved in Settings (issue #1667). Mobile has
 // no keyring backend, and the keyring crate silently falls back to an
@@ -472,6 +476,9 @@ pub fn run() {
     // every build, the App Store one included (which has no AWS CLI fallback).
     let builder = builder.manage(aws_credentials::AwsSsoLoginState::default());
 
+    // Pools for the in-process PostGIS tile renderer, created on first connect.
+    let builder = builder.manage(postgis_tiles::PostgisTilesState::default());
+
     // The Martin/sidecar/Jupyter process managers exist only where the commands
     // that spawn those processes do; the MAS build compiles both out together.
     #[cfg(not(feature = "mas"))]
@@ -536,7 +543,11 @@ pub fn run() {
             secure_store::secure_store_get_many,
             secure_store::secure_store_seal,
             secure_store::secure_store_set,
-            secure_store::secure_store_delete
+            secure_store::secure_store_delete,
+            postgis_tiles::postgis_tiles_list_sources,
+            postgis_tiles::postgis_tiles_source_info,
+            postgis_tiles::postgis_tiles_tile,
+            postgis_tiles::postgis_tiles_disconnect
         ])
         // A new document in a webview hydrates credentials again, so give it
         // back its one startup read (secure_store.rs, issue #2858).

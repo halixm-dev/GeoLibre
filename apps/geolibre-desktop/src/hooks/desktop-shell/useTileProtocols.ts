@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { registerKmlSuperOverlayProtocol } from "../../lib/kml-super-overlay";
 import { registerMbtilesProtocol } from "../../lib/mbtiles";
+import { registerPostgisTilesProtocol } from "../../lib/postgis-tiles";
 import { isTauri } from "../../lib/tauri-io";
 import { registerXyzTileProtocol } from "../../lib/xyz-url";
 
@@ -13,6 +14,9 @@ export function useTileProtocols(): void {
     void registerKmlSuperOverlayProtocol();
     if (isTauri()) {
       registerMbtilesProtocol();
+      // A reopened project's PostGIS tile layers resolve their connection from
+      // the saved list, so the protocol must exist before any Add Data visit.
+      registerPostgisTilesProtocol();
       registerXyzTileProtocol();
     }
   }, []);
