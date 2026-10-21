@@ -44,10 +44,12 @@ PostgreSQL connection. The database server must therefore be reachable from
 the device's network. Mobile layers are read-only: the editable mode needs the
 desktop app's Python sidecar.
 
-TLS follows libpq's `sslmode`: `prefer` (the default) and `require` encrypt
-without checking the server certificate, `verify-ca` checks the chain and
-`verify-full` also the host name, against the bundled public roots or the PEM
-file named by `sslrootcert`. Connections through PgBouncer and hosted poolers
+TLS follows libpq's `sslmode`. `prefer` (the default) tries TLS first but
+falls back to a plaintext connection when the server does not offer it; to
+make encryption mandatory, use `require`, `verify-ca` or `verify-full`.
+`require` encrypts without checking the server certificate, `verify-ca`
+checks the chain and `verify-full` also the host name, against the bundled
+public roots or the PEM file named by `sslrootcert`. Connections through PgBouncer and hosted poolers
 work: the 30-second query timeout is set after connecting, not as a startup
 parameter.
 
@@ -105,7 +107,7 @@ export RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,comm
 ```
 
 > It has to be the `RUSTFLAGS` **environment variable**. Putting the same flags
-> in `target.<triple>.rustflags` in a `.cargo/config.toml` does *not* work: the
+> in `target.<triple>.rustflags` in a `.cargo/config.toml` does _not_ work: the
 > Tauri CLI sets `RUSTFLAGS` itself when it invokes cargo for Android, and an
 > env `RUSTFLAGS` overrides the config file outright. The config-file form is
 > silently ignored — it parses, it builds, and it ships 4 KB-aligned libraries
@@ -151,7 +153,7 @@ npx tauri android build --aab                    # universal AAB for Google Play
 - Output:
   `src-tauri/gen/android/app/build/outputs/apk/<abi>/release/app-<abi>-release-unsigned.apk`,
   where `<abi>` is Tauri's short name — **`arm64`**, `arm`, `x86`, `x86_64` —
-  *not* the Android ABI directory name (`arm64-v8a`, `armeabi-v7a`) that appears
+  _not_ the Android ABI directory name (`arm64-v8a`, `armeabi-v7a`) that appears
   inside the APK under `lib/`.
 
 - Sideload/GitHub-release path: the per-ABI **APKs**.
@@ -216,7 +218,7 @@ installable for testing:
 - `ANDROID_KEY_PASSWORD`
 
 It also builds a universal **AAB** and uploads it as the separate
-`geolibre-android-play-aab` artifact — but *only* on runs that have the real
+`geolibre-android-play-aab` artifact — but _only_ on runs that have the real
 release keystore, since Play rejects a debug-signed bundle. Without the keystore
 the AAB build is skipped entirely rather than built and discarded. On a published
 release the `geolibre-android.aab` is attached to the release alongside the APKs,
@@ -273,7 +275,7 @@ is one-time Play Console onboarding.
    2023-11-13 must run a closed test with **12 opted-in testers for 14
    consecutive days** before they can apply for production access. Organization
    accounts are exempt.
-2. **Play App Signing.** Upload `upload.jks` as the *upload* key; Google holds
+2. **Play App Signing.** Upload `upload.jks` as the _upload_ key; Google holds
    the actual app signing key and re-signs each bundle. The repository's
    `ANDROID_KEYSTORE_*` secrets are that upload key — keep the keystore backed
    up, since losing it requires a Play support reset.
@@ -288,11 +290,11 @@ is one-time Play Console onboarding.
 5. **Privacy policy URL** — point at the published [privacy policy](privacy.md).
 6. **Data safety form.** Declare each network destination honestly: geocoding,
    the AI assistant, basemap/tile fetches, and Google OAuth for Earth Engine.
-   Note which are *transmitted* versus *collected* — GeoLibre does not operate a
+   Note which are _transmitted_ versus _collected_ — GeoLibre does not operate a
    backend that retains user data, but the form asks per-purpose.
 7. **Content rating** questionnaire and target audience.
 
-Keep *Known limitations* below in mind for each update: several Add Data paths
+Keep _Known limitations_ below in mind for each update: several Add Data paths
 are still inert on Android. A user tapping one and getting nothing is a one-star
 review, so gate them on mobile the way the sidecar tools already are via
 `isMobile()`.

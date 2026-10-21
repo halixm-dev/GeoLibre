@@ -436,6 +436,30 @@ describe("savedPostgresConnectionLabel", () => {
     );
   });
 
+  it("masks a URI that the URL parser reads as an opaque path", () => {
+    // Chromium before 130 parsed `postgresql:` with an empty host and the
+    // password left in the path.
+    const realUrl = globalThis.URL;
+    globalThis.URL = class extends realUrl {
+      get host() {
+        return "";
+      }
+      get password() {
+        return "";
+      }
+    } as typeof URL;
+    try {
+      assert.equal(
+        savedPostgresConnectionLabel(
+          "postgresql://gis:secret@db.example.com/city?password=two&sslmode=require",
+        ),
+        "postgresql://gis:****@db.example.com/city?password=****&sslmode=require",
+      );
+    } finally {
+      globalThis.URL = realUrl;
+    }
+  });
+
   it("leaves a URI query without a password untouched", () => {
     const connection = "postgresql://gis@db.example.com/city?options=-c%20search_path%3Dgis";
     assert.equal(savedPostgresConnectionLabel(connection), connection);

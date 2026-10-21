@@ -46,8 +46,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// cannot tie up a pooled connection indefinitely.
 const TILE_STATEMENT_TIMEOUT_MS: u32 = 30_000;
 /// How long a tile plan built without its extent clip (the extent query
-/// failed) is used before the extent is tried again.
+/// failed) is used before the extent is tried again. The wait doubles after
+/// each failed retry, up to [`MAX_UNCLIPPED_PLAN_RETRY`], so a scan that
+/// always times out does not run every minute.
 const UNCLIPPED_PLAN_RETRY: Duration = Duration::from_secs(60);
+const MAX_UNCLIPPED_PLAN_RETRY: Duration = Duration::from_secs(60 * 60);
 const MVT_EXTENT: u32 = 4096;
 const MVT_BUFFER: u32 = 64;
 /// Web Mercator world width in metres (EPSG:3857).
@@ -147,8 +150,44 @@ struct TilePlan {
     /// a failed extent query.
     extent: Option<[f64; 4]>,
     fields: Vec<ColumnInfo>,
-    /// Set when the extent query failed: the plan is rebuilt after this.
-    rebuild_after: Option<Instant>,
+    /// Set when the extent query failed: the plan keeps serving tiles while
+    /// a background rebuild tries the extent again.
+    retry: Option<PlanRetry>,
+}
+
+struct PlanRetry {
+    /// When the next rebuild may start. Starting one pushes this back by
+    /// `delay`, so only one runs at a time and a failed one is not retried
+    /// at once.
+    next: std::sync::Mutex<Instant>,
+    delay: Duration,
+}
+
+impl PlanRetry {
+    fn new(delay: Duration) -> Self {
+        Self {
+            next: std::sync::Mutex::new(Instant::now() + delay),
+            delay,
+        }
+    }
+
+    /// Whether a rebuild is due; if so, claims it.
+    fn claim(&self) -> bool {
+        let Ok(mut next) = self.next.lock() else {
+            return false;
+        };
+        let now = Instant::now();
+        if now < *next {
+            return false;
+        }
+        *next = now + self.delay;
+        true
+    }
+
+    /// The wait after the rebuild this retry starts, if it fails again.
+    fn next_delay(&self) -> Duration {
+        (self.delay * 2).min(MAX_UNCLIPPED_PLAN_RETRY)
+    }
 }
 
 #[derive(Serialize)]
@@ -403,25 +442,42 @@ fn build_pool(connection: &str) -> Result<PoolEntry, String> {
     })
 }
 
-async fn tile_plan(entry: &PoolEntry, key: &SourceKey) -> Result<Arc<TilePlan>, String> {
-    let cell = {
-        let mut plans = entry.plans.lock().await;
-        let cell = plans.entry(key.clone()).or_default();
-        let expired = cell.get().is_some_and(|plan| {
-            plan.rebuild_after
-                .is_some_and(|rebuild_after| Instant::now() >= rebuild_after)
-        });
-        if expired {
-            *cell = Arc::new(OnceCell::new());
-        }
-        Arc::clone(cell)
-    };
-    cell.get_or_try_init(|| build_tile_plan(entry, key))
+async fn tile_plan(entry: &Arc<PoolEntry>, key: &SourceKey) -> Result<Arc<TilePlan>, String> {
+    let cell = Arc::clone(entry.plans.lock().await.entry(key.clone()).or_default());
+    let plan = cell
+        .get_or_try_init(|| build_tile_plan(entry, key, UNCLIPPED_PLAN_RETRY))
         .await
-        .map(Arc::clone)
+        .map(Arc::clone)?;
+    // An unclipped plan stays in use while the extent is retried in the
+    // background: rebuilding inline would stall every tile of the layer for
+    // as long as the (possibly full-scan) extent query runs.
+    if let Some(retry) = plan.retry.as_ref().filter(|retry| retry.claim()) {
+        let entry = Arc::clone(entry);
+        let key = key.clone();
+        let delay = retry.next_delay();
+        tauri::async_runtime::spawn(async move {
+            let Ok(rebuilt) = build_tile_plan(&entry, &key, delay).await else {
+                return;
+            };
+            let mut plans = entry.plans.lock().await;
+            // Only replace the cell this plan came from.
+            if let Some(current) = plans
+                .get_mut(&key)
+                .filter(|current| Arc::ptr_eq(current, &cell))
+            {
+                *current = Arc::new(OnceCell::new_with(Some(rebuilt)));
+            }
+        });
+    }
+    Ok(plan)
 }
 
-async fn build_tile_plan(entry: &PoolEntry, key: &SourceKey) -> Result<Arc<TilePlan>, String> {
+/// `retry_delay` is how long an unclipped result waits before its own retry.
+async fn build_tile_plan(
+    entry: &PoolEntry,
+    key: &SourceKey,
+    retry_delay: Duration,
+) -> Result<Arc<TilePlan>, String> {
     let client = entry.pool.get().await.map_err(pool_error)?;
     let columns = read_columns(&client, &key.schema, &key.table, &key.geometry_column).await?;
     let srid = resolve_srid(&client, key).await?;
@@ -429,21 +485,21 @@ async fn build_tile_plan(entry: &PoolEntry, key: &SourceKey) -> Result<Arc<TileP
     // A failed extent (e.g. a CRS whose transform rejects the padded box)
     // only costs the clip: fall back to filtering by the raw tile envelope,
     // and try the extent again later in case the failure was transient.
-    let (extent, rebuild_after) = match mercator_extent(&client, key, srid).await {
+    let (extent, retry) = match mercator_extent(&client, key, srid).await {
         Ok(extent) => (extent, None),
         Err(error) => {
             eprintln!(
                 "PostGIS tiles: no extent clip for {}.{} ({error}).",
                 key.schema, key.table
             );
-            (None, Some(Instant::now() + UNCLIPPED_PLAN_RETRY))
+            (None, Some(PlanRetry::new(retry_delay)))
         }
     };
     Ok(Arc::new(TilePlan {
         sql: build_tile_sql(key, srid, &columns, id_column.as_deref(), extent),
         extent,
         fields: columns,
-        rebuild_after,
+        retry,
     }))
 }
 
@@ -1339,6 +1395,24 @@ mod tests {
         let mut pools = HashMap::from([("only".to_string(), Arc::clone(&only))]);
         evict_idle_pools(&mut pools, &only);
         assert_eq!(pools.len(), 1);
+    }
+
+    #[test]
+    fn plan_retry_claims_once_and_backs_off() {
+        let retry = PlanRetry::new(Duration::ZERO);
+        assert!(retry.claim());
+        let retry = PlanRetry::new(UNCLIPPED_PLAN_RETRY);
+        assert!(!retry.claim(), "not due before its delay");
+        if let Ok(mut next) = retry.next.lock() {
+            *next = Instant::now() - Duration::from_secs(1);
+        }
+        assert!(retry.claim());
+        assert!(!retry.claim(), "a running rebuild is not claimed twice");
+        assert_eq!(retry.next_delay(), UNCLIPPED_PLAN_RETRY * 2);
+        assert_eq!(
+            PlanRetry::new(MAX_UNCLIPPED_PLAN_RETRY).next_delay(),
+            MAX_UNCLIPPED_PLAN_RETRY
+        );
     }
 
     #[test]

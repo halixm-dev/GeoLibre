@@ -357,9 +357,19 @@ export function savedPostgresConnectionsWithLabel(label: string): string[] {
   );
 }
 
+const USERINFO_PASSWORD = /(:\/\/[^:\s/@]+:)[^@\s]+@/;
+
 export function savedPostgresConnectionLabel(connectionString: string): string {
   try {
     const url = new URL(connectionString);
+    // Chromium (and Android WebView) before 130 parsed non-special schemes
+    // like `postgresql:` as an opaque path: no host, and the password stays
+    // in the path. Mask the raw string then (also covers `postgres:///db`).
+    if (!url.host) {
+      return connectionString
+        .replace(USERINFO_PASSWORD, "$1****@")
+        .replace(/([?&](?:ssl)?password=)[^&#]*/gi, "$1****");
+    }
     if (url.password) url.password = "****";
     // libpq URIs also take the password as a query parameter. Only rewrite
     // the query when one is present: re-serializing it can change unrelated
@@ -371,7 +381,7 @@ export function savedPostgresConnectionLabel(connectionString: string): string {
     return url.toString();
   } catch {
     return connectionString
-      .replace(/(:\/\/[^:\s/@]+:)[^@\s]+@/, "$1****@")
+      .replace(USERINFO_PASSWORD, "$1****@")
       .replace(/(password\s*=\s*)('[^']*'|[^\s]+)/gi, "$1****");
   }
 }

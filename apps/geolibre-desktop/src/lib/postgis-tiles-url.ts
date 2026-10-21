@@ -53,24 +53,30 @@ export function postgisTilesUrl(source: PostgisTileSourceRef): string {
 
 /** Parse an expanded tile URL back into its source and tile coordinates. */
 export function parsePostgisTileUrl(url: string): PostgisTileRequest {
-  const parsed = new URL(url);
-  if (parsed.protocol !== `${POSTGIS_TILES_PROTOCOL}:`) {
+  // Split the URL by hand rather than read `URL.hostname`/`pathname`: this is
+  // a non-special scheme, which Chromium (and Android WebView) before 130
+  // parsed as an opaque path with an empty host.
+  const prefix = `${POSTGIS_TILES_PROTOCOL}://tile/`;
+  if (!url.startsWith(prefix)) {
     throw new Error("Invalid PostGIS tile URL.");
   }
-  // `tile` is the URL's host; the path carries z/x/y.
-  const parts = parsed.pathname.split("/").filter(Boolean);
-  if (parsed.hostname !== "tile" || parts.length !== 3) {
+  const rest = url.slice(prefix.length).split("#")[0];
+  const queryStart = rest.indexOf("?");
+  const path = queryStart === -1 ? rest : rest.slice(0, queryStart);
+  const params = new URLSearchParams(queryStart === -1 ? "" : rest.slice(queryStart + 1));
+  const parts = path.split("/").filter(Boolean);
+  if (parts.length !== 3) {
     throw new Error("Invalid PostGIS tile URL.");
   }
   const [z, x, y] = parts.map(parseTileCoordinate);
-  const connectionLabel = parsed.searchParams.get("conn") ?? "";
-  const schema = parsed.searchParams.get("schema") ?? "";
-  const table = parsed.searchParams.get("table") ?? "";
-  const geometryColumn = parsed.searchParams.get("geom") ?? "";
+  const connectionLabel = params.get("conn") ?? "";
+  const schema = params.get("schema") ?? "";
+  const table = params.get("table") ?? "";
+  const geometryColumn = params.get("geom") ?? "";
   if (!connectionLabel || !schema || !table || !geometryColumn) {
     throw new Error("Invalid PostGIS tile URL.");
   }
-  const defaultSrid = parsed.searchParams.get("srid") ?? undefined;
+  const defaultSrid = params.get("srid") ?? undefined;
   return {
     connectionLabel,
     schema,

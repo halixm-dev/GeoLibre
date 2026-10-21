@@ -54,6 +54,33 @@ describe("parsePostgisTileUrl", () => {
     assert.throws(() => parsePostgisTileUrl(expand(postgisTilesUrl(source), 1, 0.5, 0)));
     assert.throws(() => parsePostgisTileUrl(good.replace(/&geom=[^&]*/, "")));
     assert.throws(() => parsePostgisTileUrl("geolibre-pgtiles://tile/1/0?conn=a"));
+    assert.throws(() => parsePostgisTileUrl(good.replace("://tile/", "://other/")));
+  });
+
+  it("does not depend on the URL parser finding a host", () => {
+    // Chromium before 130 parsed non-special schemes as an opaque path, so
+    // `hostname` was empty; the parser must not read it.
+    const url = expand(postgisTilesUrl(source), 3, 4, 5);
+    const realUrl = globalThis.URL;
+    globalThis.URL = class extends realUrl {
+      get hostname() {
+        return "";
+      }
+      get pathname() {
+        return "//tile/3/4/5";
+      }
+    } as typeof URL;
+    try {
+      assert.deepEqual(parsePostgisTileUrl(url), {
+        ...source,
+        defaultSrid: undefined,
+        z: 3,
+        x: 4,
+        y: 5,
+      });
+    } finally {
+      globalThis.URL = realUrl;
+    }
   });
 });
 
