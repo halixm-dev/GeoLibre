@@ -455,6 +455,9 @@ describe("savedPostgresConnectionLabel", () => {
         ),
         "postgresql://gis:****@db.example.com/city?password=****&sslmode=require",
       );
+      // A port and an `@` in the query are not a user:password pair.
+      const portOnly = "postgresql://host:5432/db?application_name=a@b";
+      assert.equal(savedPostgresConnectionLabel(portOnly), portOnly);
     } finally {
       globalThis.URL = realUrl;
     }

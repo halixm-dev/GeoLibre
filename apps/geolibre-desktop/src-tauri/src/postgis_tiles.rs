@@ -156,32 +156,50 @@ struct TilePlan {
 }
 
 struct PlanRetry {
-    /// When the next rebuild may start. Starting one pushes this back by
-    /// `delay`, so only one runs at a time and a failed one is not retried
-    /// at once.
-    next: std::sync::Mutex<Instant>,
+    state: std::sync::Mutex<RetryState>,
     delay: Duration,
+}
+
+struct RetryState {
+    /// When the next rebuild may start. Starting one pushes this back by
+    /// `delay`, so a failed rebuild is not retried at once.
+    next: Instant,
+    /// A rebuild is in flight. It can outlast `delay` (several queries, each
+    /// up to the statement timeout), so the deadline alone cannot keep a
+    /// second one from starting.
+    running: bool,
 }
 
 impl PlanRetry {
     fn new(delay: Duration) -> Self {
         Self {
-            next: std::sync::Mutex::new(Instant::now() + delay),
+            state: std::sync::Mutex::new(RetryState {
+                next: Instant::now() + delay,
+                running: false,
+            }),
             delay,
         }
     }
 
-    /// Whether a rebuild is due; if so, claims it.
+    /// Whether a rebuild is due and none is running; if so, claims it. The
+    /// claim lasts until [`PlanRetry::finish`].
     fn claim(&self) -> bool {
-        let Ok(mut next) = self.next.lock() else {
+        let Ok(mut state) = self.state.lock() else {
             return false;
         };
         let now = Instant::now();
-        if now < *next {
+        if state.running || now < state.next {
             return false;
         }
-        *next = now + self.delay;
+        state.running = true;
+        state.next = now + self.delay;
         true
+    }
+
+    fn finish(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.running = false;
+        }
     }
 
     /// The wait after the rebuild this retry starts, if it fails again.
@@ -452,10 +470,12 @@ async fn tile_plan(entry: &Arc<PoolEntry>, key: &SourceKey) -> Result<Arc<TilePl
     // background: rebuilding inline would stall every tile of the layer for
     // as long as the (possibly full-scan) extent query runs.
     if let Some(retry) = plan.retry.as_ref().filter(|retry| retry.claim()) {
+        let claim = RebuildClaim(Arc::clone(&plan));
         let entry = Arc::clone(entry);
         let key = key.clone();
         let delay = retry.next_delay();
         tauri::async_runtime::spawn(async move {
+            let _claim = claim;
             let Ok(rebuilt) = build_tile_plan(&entry, &key, delay).await else {
                 return;
             };
@@ -470,6 +490,17 @@ async fn tile_plan(entry: &Arc<PoolEntry>, key: &SourceKey) -> Result<Arc<TilePl
         });
     }
     Ok(plan)
+}
+
+/// Releases a plan's claimed rebuild however the rebuild task ends.
+struct RebuildClaim(Arc<TilePlan>);
+
+impl Drop for RebuildClaim {
+    fn drop(&mut self) {
+        if let Some(retry) = &self.0.retry {
+            retry.finish();
+        }
+    }
 }
 
 /// `retry_delay` is how long an unclipped result waits before its own retry.
@@ -1402,12 +1433,22 @@ mod tests {
         let retry = PlanRetry::new(Duration::ZERO);
         assert!(retry.claim());
         let retry = PlanRetry::new(UNCLIPPED_PLAN_RETRY);
+        let make_due = || {
+            if let Ok(mut state) = retry.state.lock() {
+                state.next = Instant::now() - Duration::from_secs(1);
+            }
+        };
         assert!(!retry.claim(), "not due before its delay");
-        if let Ok(mut next) = retry.next.lock() {
-            *next = Instant::now() - Duration::from_secs(1);
-        }
+        make_due();
         assert!(retry.claim());
         assert!(!retry.claim(), "a running rebuild is not claimed twice");
+        make_due();
+        assert!(
+            !retry.claim(),
+            "a rebuild that outlasts its delay is still not claimed twice"
+        );
+        retry.finish();
+        assert!(retry.claim(), "claimable again once the rebuild ends");
         assert_eq!(retry.next_delay(), UNCLIPPED_PLAN_RETRY * 2);
         assert_eq!(
             PlanRetry::new(MAX_UNCLIPPED_PLAN_RETRY).next_delay(),

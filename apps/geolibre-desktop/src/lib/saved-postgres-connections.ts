@@ -357,7 +357,9 @@ export function savedPostgresConnectionsWithLabel(label: string): string[] {
   );
 }
 
-const USERINFO_PASSWORD = /(:\/\/[^:\s/@]+:)[^@\s]+@/;
+// The password stops at `/`, `?` and `#` (a URI must percent-encode them in
+// userinfo), so a port followed by an `@` in the query is not taken for one.
+const USERINFO_PASSWORD = /(:\/\/[^:\s/?#@]+:)[^@\s/?#]+@/;
 
 export function savedPostgresConnectionLabel(connectionString: string): string {
   try {
