@@ -36,6 +36,7 @@ import {
 import { AddDataSourceForm, useAddDataSource } from "../shared";
 import { martinSourceMatchesTable } from "../martin-source-match";
 import type { OpenAddDataPostgres } from "../open-add-data";
+import { PostgresConnectionFields } from "./PostgresConnectionFields";
 import { PostgresNativeSource } from "./PostgresNativeSource";
 
 type PostgresLoadMode = "tiles" | "editable";
@@ -137,6 +138,27 @@ function PostgresMartinSource({ initialPostgres }: PostgresSourceProps) {
     // the deps — re-running on every render would clear state mid-flow.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const handleConnectionChange = (value: string) => {
+    setPostgresConnectionString(value);
+    // The fetched table list belongs to the previous connection string;
+    // invalidate it (and any in-flight listing) so a stale selection cannot be
+    // submitted against a different database.
+    if (value.trim() !== postgisConnection) {
+      listRequestRef.current += 1;
+      setPostgisTables([]);
+      setSelectedTableKey("");
+      setPostgisConnection("");
+      setPostgisStatus(null);
+      // A different database also invalidates the tiles-mode Martin
+      // connection, so a layer from the old server can't be added.
+      clearMartinState();
+      // The Browser-panel table preselect belongs to the connection it was
+      // opened for; once the user switches connections it no longer applies
+      // and must not preselect a same-named table in a different database.
+      desiredTableRef.current = null;
+    }
+  };
 
   // List the database's spatial tables through the sidecar's /postgis
   // endpoints (psycopg) for the editable-layer mode. Martin is not involved:
@@ -461,7 +483,7 @@ function PostgresMartinSource({ initialPostgres }: PostgresSourceProps) {
       <div className="space-y-3">
         {!desktopRuntime ? (
           <p className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
-            {t("addData.postgres.desktopOnlyNotice")}
+            {t("addData.postgres.webUnavailableNotice")}
           </p>
         ) : null}
         <div className="space-y-1.5">
@@ -478,73 +500,11 @@ function PostgresMartinSource({ initialPostgres }: PostgresSourceProps) {
             <p className="text-xs text-muted-foreground">{t("addData.postgres.editableNotice")}</p>
           ) : null}
         </div>
-        {savedPostgresConnections.length > 0 ? (
-          <div className="space-y-1.5">
-            <Label htmlFor="postgres-saved-connection">
-              {t("addData.postgres.savedConnection")}
-            </Label>
-            <Select
-              id="postgres-saved-connection"
-              value={
-                savedPostgresConnections.includes(postgresConnectionString)
-                  ? postgresConnectionString
-                  : ""
-              }
-              onChange={(event) => {
-                setPostgresConnectionString(event.target.value);
-                if (event.target.value.trim() !== postgisConnection) {
-                  listRequestRef.current += 1;
-                  setPostgisTables([]);
-                  setSelectedTableKey("");
-                  setPostgisConnection("");
-                  setPostgisStatus(null);
-                  // A different database also invalidates the tiles-mode Martin
-                  // connection, so a layer from the old server can't be added.
-                  clearMartinState();
-                  // The Browser-panel table preselect belongs to the connection
-                  // it was opened for; once the user switches connections it no
-                  // longer applies and must not preselect a same-named table in
-                  // a different database.
-                  desiredTableRef.current = null;
-                }
-              }}
-            >
-              <option value="">{t("addData.postgres.selectSavedConnection")}</option>
-              {savedPostgresConnections.map((connection) => (
-                <option key={connection} value={connection}>
-                  {savedPostgresConnectionLabel(connection)}
-                </option>
-              ))}
-            </Select>
-          </div>
-        ) : null}
-        <div className="space-y-1.5">
-          <Label htmlFor="postgres-connection">{t("addData.postgres.connectionString")}</Label>
-          <Input
-            id="postgres-connection"
-            type="password"
-            autoComplete="off"
-            placeholder={t("addData.postgres.connectionStringPlaceholder")}
-            value={postgresConnectionString}
-            onChange={(event) => {
-              setPostgresConnectionString(event.target.value);
-              // The fetched table list belongs to the previous connection
-              // string; invalidate it (and any in-flight listing) so a stale
-              // selection cannot be submitted against a different database.
-              if (event.target.value.trim() !== postgisConnection) {
-                listRequestRef.current += 1;
-                setPostgisTables([]);
-                setSelectedTableKey("");
-                setPostgisConnection("");
-                setPostgisStatus(null);
-                // See the saved-connection handler: a connection change voids
-                // the tiles-mode Martin connection and the table preselect.
-                clearMartinState();
-                desiredTableRef.current = null;
-              }
-            }}
-          />
-        </div>
+        <PostgresConnectionFields
+          savedConnections={savedPostgresConnections}
+          connectionString={postgresConnectionString}
+          onConnectionChange={handleConnectionChange}
+        />
         <div className="grid gap-3 sm:grid-cols-[1fr_auto]">
           <div className="space-y-1.5">
             {loadMode === "tiles" ? (

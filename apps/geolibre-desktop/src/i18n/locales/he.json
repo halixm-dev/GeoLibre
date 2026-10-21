@@ -1054,7 +1054,6 @@
       "errorConnectFirst": "יש להתחבר קודם ל-PostgreSQL.",
       "errorNoVectorLayers": "למקור ה-Martin שנבחר אין שכבות וקטוריות.",
       "errorSelectSource": "יש לבחור מקור Martin להוספה.",
-      "desktopOnlyNotice": "שכבות PostgreSQL זמינות רק ב-GeoLibre Desktop. התכונה הזו מפעילה שרת אריחים Martin מקומי, שיישומי האינטרנט והנייד אינם יכולים להפעיל.",
       "savedConnection": "חיבור שמור",
       "selectSavedConnection": "בחירת חיבור שמור",
       "connectionString": "מחרוזת חיבור ל-PostgreSQL",

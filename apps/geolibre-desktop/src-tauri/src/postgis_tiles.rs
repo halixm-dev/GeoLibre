@@ -8,8 +8,9 @@
 //! `ST_AsMVT` and hands the protobuf bytes back over IPC. No local HTTP server
 //! is bound, so nothing here needs a listening socket.
 //!
-//! Connection pools are keyed by the connection string and kept for the life
-//! of the app; the frontend sends the string with every call, so a saved
+//! Connection pools are keyed by the connection string and kept until the
+//! frontend releases them (its last layer on that database is gone) or they
+//! are evicted; the frontend sends the string with every call, so a saved
 //! project's layers resolve again after a restart without any server state.
 
 use std::collections::HashMap;
@@ -26,7 +27,7 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{
     CertificateError, ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, OnceCell};
 use tokio_postgres::config::SslMode;
 use tokio_postgres::NoTls;
@@ -36,7 +37,8 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 /// sockets for every connection string the user ever tried.
 const MAX_POOLS: usize = 4;
 /// Connections per pool. MapLibre requests several tiles in parallel, and one
-/// PostgreSQL connection runs its queries one after another.
+/// PostgreSQL connection runs its queries one after another. The frontend's
+/// `MAX_TILES_IN_FLIGHT` (`postgis-tiles-url.ts`) must match; a test checks.
 const POOL_SIZE: usize = 4;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Server-side cap on a single query (set per session after connecting unless
@@ -88,19 +90,44 @@ impl PoolSlot {
             .map(|last_used| *last_used)
             .unwrap_or_else(|_| Instant::now())
     }
-
-    fn close(&self) {
-        if let Some(entry) = self.entry.get() {
-            entry.pool.close();
-        }
-    }
 }
 
+/// A pool is never closed explicitly: removing its slot from the map (an
+/// eviction or a disconnect) drops the map's reference, and the connections
+/// close once the last in-flight request holding the entry finishes. That
+/// keeps tiles already being rendered from failing, and also covers a slot
+/// removed while it was still connecting.
 struct PoolEntry {
     pool: Pool,
     /// Tile SQL per source, built once: concurrent first tiles wait on the
     /// same cell instead of each running the (possibly full-scan) build.
     plans: Mutex<HashMap<SourceKey, Arc<OnceCell<Arc<TilePlan>>>>>,
+}
+
+/// One source as the frontend names it, shared by the per-source commands.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostgisTileSourceRequest {
+    connection: String,
+    default_srid: Option<String>,
+    schema: String,
+    table: String,
+    geometry_column: String,
+}
+
+impl PostgisTileSourceRequest {
+    fn into_key(self) -> Result<(String, SourceKey), String> {
+        let default_srid = parse_default_srid(self.default_srid.as_deref())?;
+        Ok((
+            self.connection,
+            SourceKey {
+                schema: self.schema,
+                table: self.table,
+                geometry_column: self.geometry_column,
+                default_srid,
+            },
+        ))
+    }
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -187,20 +214,10 @@ pub async fn postgis_tiles_list_sources(
 #[tauri::command]
 pub async fn postgis_tiles_source_info(
     state: tauri::State<'_, PostgisTilesState>,
-    connection: String,
-    default_srid: Option<String>,
-    schema: String,
-    table: String,
-    geometry_column: String,
+    source: PostgisTileSourceRequest,
 ) -> Result<PostgisTileSourceInfo, String> {
-    let default_srid = parse_default_srid(default_srid.as_deref())?;
+    let (connection, key) = source.into_key()?;
     let entry = pool_for(&state, &connection).await?;
-    let key = SourceKey {
-        schema,
-        table,
-        geometry_column,
-        default_srid,
-    };
     // The plan holds everything the metadata needs, and building it here
     // warms the cache for the layer's first tiles. A failed extent leaves
     // `bounds` empty (no fit-to-layer) rather than failing the add.
@@ -225,27 +242,16 @@ pub async fn postgis_tiles_source_info(
 /// Render one vector tile. Returns raw protobuf bytes (empty for an empty
 /// tile) without JSON-encoding them through the IPC layer.
 #[tauri::command]
-#[allow(clippy::too_many_arguments)]
 pub async fn postgis_tiles_tile(
     state: tauri::State<'_, PostgisTilesState>,
-    connection: String,
-    default_srid: Option<String>,
-    schema: String,
-    table: String,
-    geometry_column: String,
+    source: PostgisTileSourceRequest,
     z: u32,
     x: u32,
     y: u32,
 ) -> Result<tauri::ipc::Response, String> {
     validate_tile(z, x, y)?;
-    let default_srid = parse_default_srid(default_srid.as_deref())?;
+    let (connection, key) = source.into_key()?;
     let entry = pool_for(&state, &connection).await?;
-    let key = SourceKey {
-        schema,
-        table,
-        geometry_column,
-        default_srid,
-    };
     let plan = tile_plan(&entry, &key).await?;
     let client = entry.pool.get().await.map_err(pool_error)?;
     let margin =
@@ -258,7 +264,8 @@ pub async fn postgis_tiles_tile(
     Ok(tauri::ipc::Response::new(bytes.unwrap_or_default()))
 }
 
-/// Close every pool, e.g. when the user stops the connection in Add Data.
+/// Release a connection's pool (or every pool) once no layer uses it. See
+/// [`PoolEntry`] for why in-flight requests still finish.
 #[tauri::command]
 pub async fn postgis_tiles_disconnect(
     state: tauri::State<'_, PostgisTilesState>,
@@ -267,15 +274,9 @@ pub async fn postgis_tiles_disconnect(
     let mut pools = state.pools.lock().await;
     match connection {
         Some(connection) => {
-            if let Some(slot) = pools.remove(connection.trim()) {
-                slot.close();
-            }
+            pools.remove(connection.trim());
         }
-        None => {
-            for (_, slot) in pools.drain() {
-                slot.close();
-            }
-        }
+        None => pools.clear(),
     }
     Ok(())
 }
@@ -287,27 +288,22 @@ async fn pool_for(state: &PostgisTilesState, connection: &str) -> Result<Arc<Poo
     }
     let slot = {
         let mut pools = state.pools.lock().await;
-        match pools.get(connection) {
-            Some(slot) => Arc::clone(slot),
-            None => {
-                if pools.len() >= MAX_POOLS {
-                    let idle = pools
-                        .iter()
-                        .min_by_key(|(_, slot)| slot.last_used())
-                        .map(|(key, _)| key.clone());
-                    if let Some(evicted) = idle.and_then(|key| pools.remove(&key)) {
-                        evicted.close();
-                    }
-                }
-                let slot = Arc::new(PoolSlot::new());
-                pools.insert(connection.to_string(), Arc::clone(&slot));
-                slot
-            }
-        }
+        let slot = pools
+            .entry(connection.to_string())
+            .or_insert_with(|| Arc::new(PoolSlot::new()));
+        Arc::clone(slot)
     };
     slot.touch();
+    let connected_now = !slot.entry.initialized();
     match slot.entry.get_or_try_init(|| connect(connection)).await {
-        Ok(entry) => Ok(Arc::clone(entry)),
+        Ok(entry) => {
+            // Evict only once the new connection works, so a mistyped string
+            // never costs a pool that live layers are using.
+            if connected_now {
+                evict_idle_pools(&mut *state.pools.lock().await, &slot);
+            }
+            Ok(Arc::clone(entry))
+        }
         Err(error) => {
             // Drop the failed slot so the next call tries again, unless a
             // disconnect or another connect already replaced it.
@@ -319,6 +315,31 @@ async fn pool_for(state: &PostgisTilesState, connection: &str) -> Result<Arc<Poo
                 pools.remove(connection);
             }
             Err(error)
+        }
+    }
+}
+
+/// Drop the least recently used connected pools beyond [`MAX_POOLS`], never
+/// `keep` (the one just connected). Slots still connecting do not count.
+fn evict_idle_pools(pools: &mut HashMap<String, Arc<PoolSlot>>, keep: &Arc<PoolSlot>) {
+    loop {
+        let connected = pools
+            .values()
+            .filter(|slot| slot.entry.initialized())
+            .count();
+        if connected <= MAX_POOLS {
+            return;
+        }
+        let idle = pools
+            .iter()
+            .filter(|(_, slot)| slot.entry.initialized() && !Arc::ptr_eq(slot, keep))
+            .min_by_key(|(_, slot)| slot.last_used())
+            .map(|(key, _)| key.clone());
+        match idle {
+            Some(key) => {
+                pools.remove(&key);
+            }
+            None => return,
         }
     }
 }
@@ -570,10 +591,10 @@ async fn mercator_extent(
         // clipped tile envelope is never degenerate.
         let pad = ((east - west).max(north - south) * 0.01).max(10.0);
         [
-            clamp(west - pad, -WEB_MERCATOR_HALF, WEB_MERCATOR_HALF),
-            clamp(south - pad, -WEB_MERCATOR_HALF, WEB_MERCATOR_HALF),
-            clamp(east + pad, -WEB_MERCATOR_HALF, WEB_MERCATOR_HALF),
-            clamp(north + pad, -WEB_MERCATOR_HALF, WEB_MERCATOR_HALF),
+            (west - pad).clamp(-WEB_MERCATOR_HALF, WEB_MERCATOR_HALF),
+            (south - pad).clamp(-WEB_MERCATOR_HALF, WEB_MERCATOR_HALF),
+            (east + pad).clamp(-WEB_MERCATOR_HALF, WEB_MERCATOR_HALF),
+            (north + pad).clamp(-WEB_MERCATOR_HALF, WEB_MERCATOR_HALF),
         ]
     }))
 }
@@ -583,10 +604,7 @@ fn mercator_to_lon_lat(x: f64, y: f64) -> (f64, f64) {
     const EARTH_RADIUS: f64 = 6_378_137.0;
     let lon = (x / EARTH_RADIUS).to_degrees();
     let lat = (y / EARTH_RADIUS).sinh().atan().to_degrees();
-    (
-        clamp(lon, -180.0, 180.0),
-        clamp(lat, -85.051_129, 85.051_129),
-    )
+    (lon.clamp(-180.0, 180.0), lat.clamp(-85.051_129, 85.051_129))
 }
 
 /// A geometry column's SRID: as registered, or the user's default SRID for a
@@ -1094,10 +1112,6 @@ fn quote_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-fn clamp(value: f64, min: f64, max: f64) -> f64 {
-    value.max(min).min(max)
-}
-
 fn pool_error(error: deadpool_postgres::PoolError) -> String {
     match error {
         deadpool_postgres::PoolError::Backend(error) => connect_error(&error),
@@ -1288,6 +1302,43 @@ mod tests {
         assert!(validate_tile(3, 7, 7).is_ok());
         assert!(validate_tile(3, 8, 0).is_err());
         assert!(validate_tile(31, 0, 0).is_err());
+    }
+
+    fn slot(connected: bool, age_secs: u64) -> Arc<PoolSlot> {
+        let slot = PoolSlot::new();
+        if let Ok(mut last_used) = slot.last_used.lock() {
+            *last_used = Instant::now() - Duration::from_secs(age_secs);
+        }
+        if connected {
+            // Building a pool does not connect, so no database is needed.
+            let entry = build_pool("host=localhost dbname=gis sslmode=disable").unwrap();
+            assert!(slot.entry.set(Arc::new(entry)).is_ok());
+        }
+        Arc::new(slot)
+    }
+
+    #[test]
+    fn evicts_the_least_recently_used_connected_pool() {
+        let newest = slot(true, 0);
+        let mut pools: HashMap<String, Arc<PoolSlot>> = HashMap::from([
+            ("a".to_string(), slot(true, 50)),
+            ("b".to_string(), slot(true, 40)),
+            ("c".to_string(), slot(true, 30)),
+            ("d".to_string(), slot(true, 20)),
+            // Still connecting, and oldest: neither counted nor evicted.
+            ("pending".to_string(), slot(false, 99)),
+            ("new".to_string(), Arc::clone(&newest)),
+        ]);
+        evict_idle_pools(&mut pools, &newest);
+        let mut left: Vec<_> = pools.keys().cloned().collect();
+        left.sort();
+        assert_eq!(left, ["b", "c", "d", "new", "pending"]);
+
+        // At the limit nothing goes, and the pool just connected never does.
+        let only = slot(true, 1_000);
+        let mut pools = HashMap::from([("only".to_string(), Arc::clone(&only))]);
+        evict_idle_pools(&mut pools, &only);
+        assert_eq!(pools.len(), 1);
     }
 
     #[test]

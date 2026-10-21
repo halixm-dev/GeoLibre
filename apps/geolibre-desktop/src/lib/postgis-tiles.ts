@@ -9,25 +9,22 @@
  * connection string from this session's connects or the saved connections.
  */
 
+import { useAppStore } from "@geolibre/core";
 import { invoke } from "@tauri-apps/api/core";
+import i18next from "i18next";
 import { addProtocol } from "maplibre-gl";
 import {
+  MAX_TILES_IN_FLIGHT,
   POSTGIS_TILES_PROTOCOL,
   parsePostgisTileUrl,
+  postgisTilesConnectionLabels,
   type PostgisTileSourceRef,
 } from "./postgis-tiles-url";
 import { createRequestLimiter, type RequestLimiter } from "./request-limiter";
 import {
-  readSavedPostgresConnections,
   savedPostgresConnectionLabel,
+  savedPostgresConnectionsWithLabel,
 } from "./saved-postgres-connections";
-
-/**
- * Tile requests sent to the backend at once per connection: its pool size
- * (`POOL_SIZE` in `postgis_tiles.rs`). The rest wait here, where a tile
- * MapLibre cancels can still be dropped; once sent, a request cannot be.
- */
-const MAX_TILES_IN_FLIGHT = 4;
 
 export interface PostgisTileSource {
   schema: string;
@@ -75,10 +72,19 @@ export function rememberPostgisTilesConnection(connection: string): string {
 export function resolvePostgisTilesConnection(label: string): string | null {
   const session = sessionConnections.get(label);
   if (session) return session;
-  const matches = readSavedPostgresConnections().filter(
-    (connection) => savedPostgresConnectionLabel(connection) === label,
-  );
+  const matches = savedPostgresConnectionsWithLabel(label);
   return matches.length === 1 ? matches[0] : null;
+}
+
+/** The backend's `PostgisTileSourceRequest`. */
+function sourceRequest(connection: string, source: Omit<PostgisTileSourceRef, "connectionLabel">) {
+  return {
+    connection,
+    defaultSrid: source.defaultSrid?.trim() || null,
+    schema: source.schema,
+    table: source.table,
+    geometryColumn: source.geometryColumn,
+  };
 }
 
 export function listPostgisTileSources(
@@ -96,17 +102,26 @@ export function readPostgisTileSourceInfo(
   source: Omit<PostgisTileSourceRef, "connectionLabel">,
 ): Promise<PostgisTileSourceInfo> {
   return invoke<PostgisTileSourceInfo>("postgis_tiles_source_info", {
-    connection,
-    defaultSrid: source.defaultSrid?.trim() || null,
-    schema: source.schema,
-    table: source.table,
-    geometryColumn: source.geometryColumn,
+    source: sourceRequest(connection, source),
   });
 }
 
-/** Close the backend's pool for a connection (or all pools). */
+/**
+ * Release the backend's pool for a connection (or all pools). Tiles already
+ * being rendered still finish.
+ */
 export function disconnectPostgisTiles(connection?: string): Promise<void> {
   return invoke("postgis_tiles_disconnect", { connection: connection ?? null });
+}
+
+/**
+ * Release a connection's pool unless a layer on the map still uses it, e.g.
+ * when the Add Data form moves to another database or closes without adding.
+ */
+export function releasePostgisTilesConnectionIfUnused(connection: string): void {
+  const label = savedPostgresConnectionLabel(connection);
+  if (postgisTilesConnectionLabels(useAppStore.getState().layers).has(label)) return;
+  void disconnectPostgisTiles(connection).catch(() => {});
 }
 
 /**
@@ -116,11 +131,7 @@ export function disconnectPostgisTiles(connection?: string): Promise<void> {
 export function releasePostgisTilesConnections(labels: Iterable<string>): void {
   for (const label of labels) {
     tileLimiters.delete(label);
-    const candidates = new Set(
-      readSavedPostgresConnections().filter(
-        (connection) => savedPostgresConnectionLabel(connection) === label,
-      ),
-    );
+    const candidates = new Set(savedPostgresConnectionsWithLabel(label));
     const session = sessionConnections.get(label);
     if (session) candidates.add(session);
     for (const connection of candidates) {
@@ -145,7 +156,7 @@ export function registerPostgisTilesProtocol(): void {
     const connection = resolvePostgisTilesConnection(tile.connectionLabel);
     if (!connection) {
       throw new Error(
-        `No saved PostgreSQL connection matches ${tile.connectionLabel}. Reconnect it in Add Data.`,
+        i18next.t("addData.postgres.errorNoMatchingConnection", { label: tile.connectionLabel }),
       );
     }
     // The command returns a raw tauri::ipc::Response, which arrives as an
@@ -153,11 +164,7 @@ export function registerPostgisTilesProtocol(): void {
     const data = await tileLimiter(tile.connectionLabel)(
       () =>
         invoke<ArrayBuffer>("postgis_tiles_tile", {
-          connection,
-          defaultSrid: tile.defaultSrid ?? null,
-          schema: tile.schema,
-          table: tile.table,
-          geometryColumn: tile.geometryColumn,
+          source: sourceRequest(connection, tile),
           z: tile.z,
           x: tile.x,
           y: tile.y,

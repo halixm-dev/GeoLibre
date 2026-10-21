@@ -1335,6 +1335,13 @@ output when a build actually runs. Rebuild, or delete the stale directory.
 
 ## Generated files and cross-file sync
 
+- **Native PostGIS tile concurrency.** `MAX_TILES_IN_FLIGHT` in
+  `apps/geolibre-desktop/src/lib/postgis-tiles-url.ts` caps tile requests per
+  connection at the Rust pool size, `POOL_SIZE` in
+  `src-tauri/src/postgis_tiles.rs`, so surplus tiles wait where MapLibre can
+  still cancel them. Change both together; `tests/postgis-tiles-url.test.ts`
+  reads the Rust constant and fails on drift.
+
 - **The open data gallery.** [`gallery.md`](gallery.md) and the "Open data
   showcase" teaser on [`demos.md`](demos.md) (between the
   `<!-- demo-gallery-teaser -->` markers) are generated from

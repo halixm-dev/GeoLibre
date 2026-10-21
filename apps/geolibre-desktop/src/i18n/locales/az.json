@@ -1032,7 +1032,6 @@
       "errorConnectFirst": "Əvvəlcə PostgreSQL-ə qoşulun.",
       "errorNoVectorLayers": "Seçilmiş Martin mənbəsində vektor layı yoxdur.",
       "errorSelectSource": "Əlavə etmək üçün Martin mənbəsi seçin.",
-      "desktopOnlyNotice": "PostgreSQL layları yalnız GeoLibre Desktop-da mövcuddur. Bu funksiya yerli Martin plitə serverini işə salır; veb və mobil tətbiqlər onu işə sala bilmir.",
       "savedConnection": "Yadda saxlanmış bağlantı",
       "selectSavedConnection": "Yadda saxlanmış bağlantını seçin",
       "connectionString": "PostgreSQL bağlantı sətri",

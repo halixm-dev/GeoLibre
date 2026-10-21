@@ -1,16 +1,15 @@
-import { useAppStore } from "@geolibre/core";
 import { Button, Input, Label, Select } from "@geolibre/ui";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
-  disconnectPostgisTiles,
   listPostgisTileSources,
   readPostgisTileSourceInfo,
   registerPostgisTilesProtocol,
+  releasePostgisTilesConnectionIfUnused,
   rememberPostgisTilesConnection,
   type PostgisTileSource,
 } from "../../../../lib/postgis-tiles";
-import { postgisTilesConnectionLabels, postgisTilesUrl } from "../../../../lib/postgis-tiles-url";
+import { POSTGIS_TILES_SOURCE_KIND, postgisTilesUrl } from "../../../../lib/postgis-tiles-url";
 import {
   createBaseLayer,
   errorMessage,
@@ -19,6 +18,7 @@ import {
   savedPostgresConnectionLabel,
 } from "../helpers";
 import { AddDataSourceForm, useAddDataSource } from "../shared";
+import { PostgresConnectionFields } from "./PostgresConnectionFields";
 import type { OpenAddDataPostgres } from "../open-add-data";
 
 /** Zoom range the in-process renderer advertises to MapLibre. */
@@ -72,22 +72,16 @@ export function PostgresNativeSource({ initialPostgres }: PostgresNativeSourcePr
       : null,
   );
 
-  // Closing the form without adding a layer leaves a pool no layer uses;
-  // close it rather than wait for eviction.
-  const connectedRef = useRef(connected);
+  // Every connection string this form opened a backend pool for. Moving to
+  // another database, or closing the form, releases the ones no layer on the
+  // map uses rather than leaving them for eviction.
+  const openedRef = useRef(new Set<string>());
   useEffect(() => {
-    connectedRef.current = connected;
-  }, [connected]);
-  useEffect(
-    () => () => {
-      const last = connectedRef.current;
-      if (!last) return;
-      const label = savedPostgresConnectionLabel(last.connection);
-      if (postgisTilesConnectionLabels(useAppStore.getState().layers).has(label)) return;
-      void disconnectPostgisTiles(last.connection).catch(() => {});
-    },
-    [],
-  );
+    const opened = openedRef.current;
+    return () => {
+      for (const connection of opened) releasePostgisTilesConnectionIfUnused(connection);
+    };
+  }, []);
 
   const resetConnection = () => {
     requestRef.current += 1;
@@ -114,7 +108,14 @@ export function PostgresNativeSource({ initialPostgres }: PostgresNativeSourcePr
       const connection = connectionString.trim();
       if (!connection) throw new Error(t("addData.postgres.errorConnectionString"));
       const listed = await listPostgisTileSources(connection, defaultSrid);
+      // Recorded even when superseded, so that pool is still released later.
+      openedRef.current.add(connection);
       if (requestRef.current !== requestToken) return;
+      for (const previous of openedRef.current) {
+        if (previous === connection) continue;
+        releasePostgisTilesConnectionIfUnused(previous);
+        openedRef.current.delete(previous);
+      }
       setSavedConnections(rememberPostgresConnection(connection));
       setConnected({ connection, defaultSrid: defaultSrid.trim() });
       setSources(listed);
@@ -180,7 +181,7 @@ export function PostgresNativeSource({ initialPostgres }: PostgresNativeSourcePr
           bounds,
           minzoom: 0,
           maxzoom: NATIVE_TILES_MAXZOOM,
-          sourceKind: "postgis-tiles",
+          sourceKind: POSTGIS_TILES_SOURCE_KIND,
           sourceLayers: [info.layer],
           fields: info.fields,
           postgisSchema: selected.schema,
@@ -214,36 +215,11 @@ export function PostgresNativeSource({ initialPostgres }: PostgresNativeSourcePr
     >
       <div className="space-y-3">
         <p className="text-xs text-muted-foreground">{t("addData.postgres.nativeTilesNotice")}</p>
-        {savedConnections.length > 0 ? (
-          <div className="space-y-1.5">
-            <Label htmlFor="postgres-saved-connection">
-              {t("addData.postgres.savedConnection")}
-            </Label>
-            <Select
-              id="postgres-saved-connection"
-              value={savedConnections.includes(connectionString) ? connectionString : ""}
-              onChange={(event) => handleConnectionChange(event.target.value)}
-            >
-              <option value="">{t("addData.postgres.selectSavedConnection")}</option>
-              {savedConnections.map((connection) => (
-                <option key={connection} value={connection}>
-                  {savedPostgresConnectionLabel(connection)}
-                </option>
-              ))}
-            </Select>
-          </div>
-        ) : null}
-        <div className="space-y-1.5">
-          <Label htmlFor="postgres-connection">{t("addData.postgres.connectionString")}</Label>
-          <Input
-            id="postgres-connection"
-            type="password"
-            autoComplete="off"
-            placeholder={t("addData.postgres.connectionStringPlaceholder")}
-            value={connectionString}
-            onChange={(event) => handleConnectionChange(event.target.value)}
-          />
-        </div>
+        <PostgresConnectionFields
+          savedConnections={savedConnections}
+          connectionString={connectionString}
+          onConnectionChange={handleConnectionChange}
+        />
         <div className="grid gap-3 sm:grid-cols-[1fr_auto]">
           <div className="space-y-1.5">
             <Label htmlFor="postgres-default-srid">{t("addData.postgres.defaultSrid")}</Label>
@@ -275,7 +251,7 @@ export function PostgresNativeSource({ initialPostgres }: PostgresNativeSourcePr
         {status ? <p className="text-xs text-muted-foreground">{status}</p> : null}
         {sources.length > 0 ? (
           <div className="space-y-1.5">
-            <Label htmlFor="postgis-tile-source">{t("addData.postgres.editableTable")}</Label>
+            <Label htmlFor="postgis-tile-source">{t("addData.postgres.tileSourceTable")}</Label>
             <Select
               id="postgis-tile-source"
               value={selectedKey}

@@ -347,6 +347,16 @@ function rememberKeychainPostgresConnections(connections: string[]): void {
   void queueCredentialChanges(postgresConnectionSecrets(previous), postgresConnectionSecrets(next));
 }
 
+/**
+ * The saved connections whose masked label is `label`. Several can match:
+ * the label hides only the password (e.g. before/after a rotation).
+ */
+export function savedPostgresConnectionsWithLabel(label: string): string[] {
+  return readSavedPostgresConnections().filter(
+    (connection) => savedPostgresConnectionLabel(connection) === label,
+  );
+}
+
 export function savedPostgresConnectionLabel(connectionString: string): string {
   try {
     const url = new URL(connectionString);

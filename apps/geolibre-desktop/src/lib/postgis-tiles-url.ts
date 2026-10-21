@@ -11,6 +11,17 @@
 
 export const POSTGIS_TILES_PROTOCOL = "geolibre-pgtiles";
 
+/** `metadata.sourceKind` of a layer drawn by the in-process renderer. */
+export const POSTGIS_TILES_SOURCE_KIND = "postgis-tiles";
+
+/**
+ * Tile requests sent to the backend at once per connection: its pool size
+ * (`POOL_SIZE` in `postgis_tiles.rs`, kept equal by
+ * `tests/postgis-tiles-url.test.ts`). The rest wait in the frontend, where a
+ * tile MapLibre cancels can still be dropped; once sent, it cannot be.
+ */
+export const MAX_TILES_IN_FLIGHT = 4;
+
 export interface PostgisTileSourceRef {
   /** Password-masked connection label (see `savedPostgresConnectionLabel`). */
   connectionLabel: string;
@@ -87,7 +98,7 @@ export function postgisTilesConnectionLabels(
   const labels = new Set<string>();
   for (const { metadata } of layers) {
     const label = metadata?.postgisConnectionLabel;
-    if (metadata?.sourceKind === "postgis-tiles" && typeof label === "string" && label) {
+    if (metadata?.sourceKind === POSTGIS_TILES_SOURCE_KIND && typeof label === "string" && label) {
       labels.add(label);
     }
   }

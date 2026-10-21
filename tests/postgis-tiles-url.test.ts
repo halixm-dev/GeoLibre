@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 import {
+  MAX_TILES_IN_FLIGHT,
+  POSTGIS_TILES_SOURCE_KIND,
   parsePostgisTileUrl,
   postgisTilesConnectionLabels,
   postgisTilesUrl,
@@ -56,14 +60,29 @@ describe("parsePostgisTileUrl", () => {
 describe("postgisTilesConnectionLabels", () => {
   it("collects the connection labels of native PostGIS tile layers only", () => {
     const labels = postgisTilesConnectionLabels([
-      { metadata: { sourceKind: "postgis-tiles", postgisConnectionLabel: "a" } },
-      { metadata: { sourceKind: "postgis-tiles", postgisConnectionLabel: "a" } },
-      { metadata: { sourceKind: "postgis-tiles", postgisConnectionLabel: "b" } },
+      { metadata: { sourceKind: POSTGIS_TILES_SOURCE_KIND, postgisConnectionLabel: "a" } },
+      { metadata: { sourceKind: POSTGIS_TILES_SOURCE_KIND, postgisConnectionLabel: "a" } },
+      { metadata: { sourceKind: POSTGIS_TILES_SOURCE_KIND, postgisConnectionLabel: "b" } },
       // An editable PostGIS layer carries a label too, but holds no tile pool.
       { metadata: { postgisConnectionLabel: "c" } },
-      { metadata: { sourceKind: "postgis-tiles" } },
+      { metadata: { sourceKind: POSTGIS_TILES_SOURCE_KIND } },
       {},
     ]);
     assert.deepEqual([...labels], ["a", "b"]);
+  });
+});
+
+describe("MAX_TILES_IN_FLIGHT", () => {
+  it("matches the backend's per-connection pool size", () => {
+    // More requests than pooled connections would only queue inside the
+    // backend, where MapLibre's aborts can no longer drop them.
+    const rust = readFileSync(
+      fileURLToPath(
+        new URL("../apps/geolibre-desktop/src-tauri/src/postgis_tiles.rs", import.meta.url),
+      ),
+      "utf8",
+    );
+    const poolSize = /const POOL_SIZE: usize = (\d+);/.exec(rust)?.[1];
+    assert.equal(Number(poolSize), MAX_TILES_IN_FLIGHT);
   });
 });

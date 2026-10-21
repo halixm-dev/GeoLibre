@@ -1,8 +1,5 @@
 import { useAppStore, type GeoLibreLayer } from "@geolibre/core";
-import {
-  readSavedPostgresConnections,
-  savedPostgresConnectionLabel,
-} from "./saved-postgres-connections";
+import { savedPostgresConnectionsWithLabel } from "./saved-postgres-connections";
 
 /**
  * In-memory registry mapping an editable PostGIS layer to the connection
@@ -76,8 +73,6 @@ export function resolvePostgisConnection(layer: GeoLibreLayer): string | null {
   // only an unambiguous match: guessing between candidate credentials would
   // read as an unexplained auth failure (or hit the wrong environment), while
   // returning null surfaces the explicit "reconnect" message.
-  const matches = readSavedPostgresConnections().filter(
-    (connection) => savedPostgresConnectionLabel(connection) === label,
-  );
+  const matches = savedPostgresConnectionsWithLabel(label);
   return matches.length === 1 ? matches[0] : null;
 }
