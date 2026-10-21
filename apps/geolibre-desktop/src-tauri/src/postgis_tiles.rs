@@ -15,15 +15,19 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
+use deadpool_postgres::{Hook, HookError, Manager, ManagerConfig, Pool, RecyclingMethod};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::client::WebPkiServerVerifier;
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
+use rustls::{
+    CertificateError, ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme,
+};
 use serde::Serialize;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 use tokio_postgres::config::SslMode;
 use tokio_postgres::NoTls;
 use tokio_postgres_rustls::MakeRustlsConnect;
@@ -35,10 +39,13 @@ const MAX_POOLS: usize = 4;
 /// PostgreSQL connection runs its queries one after another.
 const POOL_SIZE: usize = 4;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-/// Server-side cap on a single query (set per session unless the connection
-/// string sets its own `options`), so a huge unindexed table cannot tie up a
-/// pooled connection indefinitely.
+/// Server-side cap on a single query (set per session after connecting unless
+/// the connection string's `options` sets its own), so a huge unindexed table
+/// cannot tie up a pooled connection indefinitely.
 const TILE_STATEMENT_TIMEOUT_MS: u32 = 30_000;
+/// How long a tile plan built without its extent clip (the extent query
+/// failed) is used before the extent is tried again.
+const UNCLIPPED_PLAN_RETRY: Duration = Duration::from_secs(60);
 const MVT_EXTENT: u32 = 4096;
 const MVT_BUFFER: u32 = 64;
 /// Web Mercator world width in metres (EPSG:3857).
@@ -48,17 +55,52 @@ const MAX_ZOOM: u32 = 30;
 
 #[derive(Default)]
 pub struct PostgisTilesState {
-    pools: Mutex<HashMap<String, Arc<PoolEntry>>>,
+    /// One slot per connection string. The map lock is only held to find or
+    /// insert a slot; connecting happens in the slot's `OnceCell`, so a slow
+    /// or unreachable host never stalls tiles from other databases, and the
+    /// parallel first tiles of one database share a single connect.
+    pools: Mutex<HashMap<String, Arc<PoolSlot>>>,
+}
+
+struct PoolSlot {
+    entry: OnceCell<Arc<PoolEntry>>,
+    /// For the least-recently-used eviction in [`pool_for`].
+    last_used: std::sync::Mutex<Instant>,
+}
+
+impl PoolSlot {
+    fn new() -> Self {
+        Self {
+            entry: OnceCell::new(),
+            last_used: std::sync::Mutex::new(Instant::now()),
+        }
+    }
+
+    fn touch(&self) {
+        if let Ok(mut last_used) = self.last_used.lock() {
+            *last_used = Instant::now();
+        }
+    }
+
+    fn last_used(&self) -> Instant {
+        self.last_used
+            .lock()
+            .map(|last_used| *last_used)
+            .unwrap_or_else(|_| Instant::now())
+    }
+
+    fn close(&self) {
+        if let Some(entry) = self.entry.get() {
+            entry.pool.close();
+        }
+    }
 }
 
 struct PoolEntry {
     pool: Pool,
-    /// The SRID assumed for geometry columns registered with SRID 0.
-    default_srid: Option<i32>,
-    /// Tile SQL per `schema.table.geometry_column`, built once per source.
-    plans: Mutex<HashMap<SourceKey, Arc<TilePlan>>>,
-    /// Insertion order for the LRU-ish eviction in [`pool_for`].
-    created: std::time::Instant,
+    /// Tile SQL per source, built once: concurrent first tiles wait on the
+    /// same cell instead of each running the (possibly full-scan) build.
+    plans: Mutex<HashMap<SourceKey, Arc<OnceCell<Arc<TilePlan>>>>>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -66,10 +108,20 @@ struct SourceKey {
     schema: String,
     table: String,
     geometry_column: String,
+    /// The SRID assumed for a geometry column registered with SRID 0. Part of
+    /// the plan key (not the pool's), so layers that share a database but not
+    /// a default SRID share one pool.
+    default_srid: Option<i32>,
 }
 
 struct TilePlan {
     sql: String,
+    /// The table's padded Web Mercator extent, or None for an empty table or
+    /// a failed extent query.
+    extent: Option<[f64; 4]>,
+    fields: Vec<ColumnInfo>,
+    /// Set when the extent query failed: the plan is rebuilt after this.
+    rebuild_after: Option<Instant>,
 }
 
 #[derive(Serialize)]
@@ -100,8 +152,9 @@ pub async fn postgis_tiles_list_sources(
     connection: String,
     default_srid: Option<String>,
 ) -> Result<Vec<PostgisTileSource>, String> {
-    let default_srid = parse_default_srid(default_srid.as_deref())?;
-    let entry = pool_for(&state, &connection, default_srid).await?;
+    // Not needed to list, but a malformed value should fail the connect.
+    parse_default_srid(default_srid.as_deref())?;
+    let entry = pool_for(&state, &connection).await?;
     let client = entry.pool.get().await.map_err(pool_error)?;
     // geometry_columns covers tables, views and materialized views. Only list
     // what this role may read, so a table the user cannot open never shows up
@@ -141,37 +194,30 @@ pub async fn postgis_tiles_source_info(
     geometry_column: String,
 ) -> Result<PostgisTileSourceInfo, String> {
     let default_srid = parse_default_srid(default_srid.as_deref())?;
-    let entry = pool_for(&state, &connection, default_srid).await?;
-    let client = entry.pool.get().await.map_err(pool_error)?;
-    let columns = read_columns(&client, &schema, &table, &geometry_column).await?;
+    let entry = pool_for(&state, &connection).await?;
     let key = SourceKey {
         schema,
         table,
         geometry_column,
+        default_srid,
     };
-    let srid = resolve_srid(
-        &client,
-        &entry,
-        &key.schema,
-        &key.table,
-        &key.geometry_column,
-    )
-    .await?;
-    let bounds = mercator_extent(&client, &key, srid)
-        .await?
-        .map(|[west, south, east, north]| {
-            let (west, south) = mercator_to_lon_lat(west, south);
-            let (east, north) = mercator_to_lon_lat(east, north);
-            [west, south, east, north]
-        });
-    let table = key.table;
+    // The plan holds everything the metadata needs, and building it here
+    // warms the cache for the layer's first tiles. A failed extent leaves
+    // `bounds` empty (no fit-to-layer) rather than failing the add.
+    let plan = tile_plan(&entry, &key).await?;
+    let bounds = plan.extent.map(|[west, south, east, north]| {
+        let (west, south) = mercator_to_lon_lat(west, south);
+        let (east, north) = mercator_to_lon_lat(east, north);
+        [west, south, east, north]
+    });
 
     Ok(PostgisTileSourceInfo {
-        layer: table,
+        layer: key.table,
         bounds,
-        fields: columns
-            .into_iter()
-            .map(|column| (column.name, column.type_name))
+        fields: plan
+            .fields
+            .iter()
+            .map(|column| (column.name.clone(), column.type_name.clone()))
             .collect(),
     })
 }
@@ -193,11 +239,12 @@ pub async fn postgis_tiles_tile(
 ) -> Result<tauri::ipc::Response, String> {
     validate_tile(z, x, y)?;
     let default_srid = parse_default_srid(default_srid.as_deref())?;
-    let entry = pool_for(&state, &connection, default_srid).await?;
+    let entry = pool_for(&state, &connection).await?;
     let key = SourceKey {
         schema,
         table,
         geometry_column,
+        default_srid,
     };
     let plan = tile_plan(&entry, &key).await?;
     let client = entry.pool.get().await.map_err(pool_error)?;
@@ -220,40 +267,64 @@ pub async fn postgis_tiles_disconnect(
     let mut pools = state.pools.lock().await;
     match connection {
         Some(connection) => {
-            if let Some(entry) = pools.remove(&connection) {
-                entry.pool.close();
+            if let Some(slot) = pools.remove(connection.trim()) {
+                slot.close();
             }
         }
         None => {
-            for (_, entry) in pools.drain() {
-                entry.pool.close();
+            for (_, slot) in pools.drain() {
+                slot.close();
             }
         }
     }
     Ok(())
 }
 
-async fn pool_for(
-    state: &PostgisTilesState,
-    connection: &str,
-    default_srid: Option<i32>,
-) -> Result<Arc<PoolEntry>, String> {
+async fn pool_for(state: &PostgisTilesState, connection: &str) -> Result<Arc<PoolEntry>, String> {
     let connection = connection.trim();
     if connection.is_empty() {
         return Err("Enter a PostgreSQL connection string.".to_string());
     }
-    let mut pools = state.pools.lock().await;
-    if let Some(entry) = pools.get(connection) {
-        if entry.default_srid == default_srid {
-            return Ok(Arc::clone(entry));
+    let slot = {
+        let mut pools = state.pools.lock().await;
+        match pools.get(connection) {
+            Some(slot) => Arc::clone(slot),
+            None => {
+                if pools.len() >= MAX_POOLS {
+                    let idle = pools
+                        .iter()
+                        .min_by_key(|(_, slot)| slot.last_used())
+                        .map(|(key, _)| key.clone());
+                    if let Some(evicted) = idle.and_then(|key| pools.remove(&key)) {
+                        evicted.close();
+                    }
+                }
+                let slot = Arc::new(PoolSlot::new());
+                pools.insert(connection.to_string(), Arc::clone(&slot));
+                slot
+            }
         }
-        // A changed default SRID changes the cached tile SQL; start fresh.
-        if let Some(stale) = pools.remove(connection) {
-            stale.pool.close();
+    };
+    slot.touch();
+    match slot.entry.get_or_try_init(|| connect(connection)).await {
+        Ok(entry) => Ok(Arc::clone(entry)),
+        Err(error) => {
+            // Drop the failed slot so the next call tries again, unless a
+            // disconnect or another connect already replaced it.
+            let mut pools = state.pools.lock().await;
+            if pools
+                .get(connection)
+                .is_some_and(|current| Arc::ptr_eq(current, &slot))
+            {
+                pools.remove(connection);
+            }
+            Err(error)
         }
     }
+}
 
-    let entry = Arc::new(build_pool(connection, default_srid)?);
+async fn connect(connection: &str) -> Result<Arc<PoolEntry>, String> {
+    let entry = build_pool(connection)?;
     // Fail the connect here with a clear message rather than on the first tile.
     let client = entry.pool.get().await.map_err(pool_error)?;
     client
@@ -261,32 +332,23 @@ async fn pool_for(
         .await
         .map_err(|_| "This database does not have the PostGIS extension enabled.".to_string())?;
     drop(client);
-
-    if pools.len() >= MAX_POOLS {
-        if let Some(oldest) = pools
-            .iter()
-            .min_by_key(|(_, entry)| entry.created)
-            .map(|(key, _)| key.clone())
-        {
-            if let Some(evicted) = pools.remove(&oldest) {
-                evicted.pool.close();
-            }
-        }
-    }
-    pools.insert(connection.to_string(), Arc::clone(&entry));
-    Ok(entry)
+    Ok(Arc::new(entry))
 }
 
-fn build_pool(connection: &str, default_srid: Option<i32>) -> Result<PoolEntry, String> {
-    let tls = TlsRequirement::from_connection_string(connection);
+fn build_pool(connection: &str) -> Result<PoolEntry, String> {
+    let tls = TlsRequirement::from_connection_string(connection)?;
     let mut config = tokio_postgres::Config::from_str(&tls.normalized_connection)
         .map_err(|error| format!("Could not parse the PostgreSQL connection string: {error}"))?;
+    config.ssl_mode(tls.ssl_mode);
     if config.get_connect_timeout().is_none() {
         config.connect_timeout(CONNECT_TIMEOUT);
     }
-    if config.get_options().is_none() {
-        config.options(format!("-c statement_timeout={TILE_STATEMENT_TIMEOUT_MS}"));
-    }
+    // The timeout is SET after connecting rather than sent as the `options`
+    // startup parameter, which PgBouncer and hosted poolers (Neon, Supabase)
+    // reject. A connection string that sets its own timeout keeps it.
+    let set_timeout = !config
+        .get_options()
+        .is_some_and(|options| options.contains("statement_timeout"));
     if config.get_application_name().is_none() {
         config.application_name("GeoLibre");
     }
@@ -298,45 +360,70 @@ fn build_pool(connection: &str, default_srid: Option<i32>) -> Result<PoolEntry, 
     } else {
         Manager::from_config(config, tls.connector()?, manager_config)
     };
-    let pool = Pool::builder(manager)
-        .max_size(POOL_SIZE)
+    let mut builder = Pool::builder(manager).max_size(POOL_SIZE);
+    if set_timeout {
+        builder = builder.post_create(Hook::async_fn(|client, _| {
+            Box::pin(async move {
+                client
+                    .batch_execute(&format!(
+                        "SET statement_timeout = {TILE_STATEMENT_TIMEOUT_MS}"
+                    ))
+                    .await
+                    .map_err(HookError::Backend)
+            })
+        }));
+    }
+    let pool = builder
         .build()
         .map_err(|error| format!("Could not create the PostgreSQL connection pool: {error}"))?;
     Ok(PoolEntry {
         pool,
-        default_srid,
         plans: Mutex::new(HashMap::new()),
-        created: std::time::Instant::now(),
     })
 }
 
 async fn tile_plan(entry: &PoolEntry, key: &SourceKey) -> Result<Arc<TilePlan>, String> {
-    if let Some(plan) = entry.plans.lock().await.get(key) {
-        return Ok(Arc::clone(plan));
-    }
+    let cell = {
+        let mut plans = entry.plans.lock().await;
+        let cell = plans.entry(key.clone()).or_default();
+        let expired = cell.get().is_some_and(|plan| {
+            plan.rebuild_after
+                .is_some_and(|rebuild_after| Instant::now() >= rebuild_after)
+        });
+        if expired {
+            *cell = Arc::new(OnceCell::new());
+        }
+        Arc::clone(cell)
+    };
+    cell.get_or_try_init(|| build_tile_plan(entry, key))
+        .await
+        .map(Arc::clone)
+}
+
+async fn build_tile_plan(entry: &PoolEntry, key: &SourceKey) -> Result<Arc<TilePlan>, String> {
     let client = entry.pool.get().await.map_err(pool_error)?;
     let columns = read_columns(&client, &key.schema, &key.table, &key.geometry_column).await?;
-    let srid = resolve_srid(
-        &client,
-        entry,
-        &key.schema,
-        &key.table,
-        &key.geometry_column,
-    )
-    .await?;
+    let srid = resolve_srid(&client, key).await?;
     let id_column = read_integer_primary_key(&client, &key.schema, &key.table).await?;
     // A failed extent (e.g. a CRS whose transform rejects the padded box)
-    // only costs the clip: fall back to filtering by the raw tile envelope.
-    let clip = mercator_extent(&client, key, srid).await.ok().flatten();
-    let plan = Arc::new(TilePlan {
-        sql: build_tile_sql(key, srid, &columns, id_column.as_deref(), clip),
-    });
-    entry
-        .plans
-        .lock()
-        .await
-        .insert(key.clone(), Arc::clone(&plan));
-    Ok(plan)
+    // only costs the clip: fall back to filtering by the raw tile envelope,
+    // and try the extent again later in case the failure was transient.
+    let (extent, rebuild_after) = match mercator_extent(&client, key, srid).await {
+        Ok(extent) => (extent, None),
+        Err(error) => {
+            eprintln!(
+                "PostGIS tiles: no extent clip for {}.{} ({error}).",
+                key.schema, key.table
+            );
+            (None, Some(Instant::now() + UNCLIPPED_PLAN_RETRY))
+        }
+    };
+    Ok(Arc::new(TilePlan {
+        sql: build_tile_sql(key, srid, &columns, id_column.as_deref(), extent),
+        extent,
+        fields: columns,
+        rebuild_after,
+    }))
 }
 
 /// The tile query. $1..$3 are z/x/y, $4 the buffer margin in metres.
@@ -575,11 +662,14 @@ async fn read_columns(
 /// The column's SRID from geometry_columns, or the default SRID for SRID 0.
 async fn resolve_srid(
     client: &deadpool_postgres::Client,
-    entry: &PoolEntry,
-    schema: &str,
-    table: &str,
-    geometry_column: &str,
+    key: &SourceKey,
 ) -> Result<ColumnSrid, String> {
+    let SourceKey {
+        schema,
+        table,
+        geometry_column,
+        default_srid,
+    } = key;
     let row = client
         .query_opt(
             "SELECT srid FROM geometry_columns \
@@ -613,7 +703,7 @@ async fn resolve_srid(
     if let Some(sampled) = sampled.filter(|srid| *srid > 0) {
         return Ok(ColumnSrid::Declared(sampled));
     }
-    entry.default_srid.map(ColumnSrid::Assumed).ok_or_else(|| {
+    default_srid.map(ColumnSrid::Assumed).ok_or_else(|| {
         format!(
             "{schema}.{table} has no SRID. Enter a default SRID (for example 4326) and connect again."
         )
@@ -647,33 +737,80 @@ async fn read_integer_primary_key(
     Ok(matches!(type_name.as_str(), "int2" | "int4" | "int8").then(|| rows[0].get(0)))
 }
 
-/// How the connection string's `sslmode` maps onto rustls.
+/// How the connection string's `sslmode`/`sslrootcert` map onto rustls.
 ///
-/// tokio-postgres only parses `disable`/`prefer`/`require`, and with a rustls
-/// connector it would always verify the certificate. libpq semantics differ:
-/// `prefer`/`require` encrypt without verifying, and only `verify-ca`/
-/// `verify-full` check the certificate. That matters in practice: hosted
-/// PostgreSQL often serves a private-CA certificate with `sslmode=require`.
+/// tokio-postgres only parses `disable`/`prefer`/`require`, rejects
+/// `sslrootcert`, and with a rustls connector it would always verify the
+/// certificate. libpq semantics differ: `prefer`/`require` encrypt without
+/// verifying, `verify-ca` checks the chain and `verify-full` also the host
+/// name. That matters in practice: hosted PostgreSQL often serves a private-CA
+/// certificate with `sslmode=require`. Both parameters are therefore taken
+/// out of the string (parsed as libpq does, so a value elsewhere that merely
+/// contains `sslmode=` is left alone) and applied here.
+#[derive(Debug)]
 struct TlsRequirement {
     normalized_connection: String,
-    verify: bool,
+    ssl_mode: SslMode,
+    verify: TlsVerify,
+    /// `sslrootcert`: a PEM file of trusted roots, or None for the bundled
+    /// public roots (also libpq's `sslrootcert=system`).
+    root_cert: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TlsVerify {
+    None,
+    Chain,
+    ChainAndHost,
 }
 
 impl TlsRequirement {
-    fn from_connection_string(connection: &str) -> Self {
-        let mut normalized = connection.to_string();
-        let mut verify = false;
-        for mode in ["verify-full", "verify-ca"] {
-            let needle = format!("sslmode={mode}");
-            if normalized.contains(&needle) {
-                normalized = normalized.replace(&needle, "sslmode=require");
-                verify = true;
-            }
-        }
-        Self {
-            normalized_connection: normalized,
+    fn from_connection_string(connection: &str) -> Result<Self, String> {
+        let (normalized_connection, taken) =
+            take_connection_params(connection, &["sslmode", "sslrootcert"]);
+        let root_cert = taken
+            .get("sslrootcert")
+            .filter(|path| !path.is_empty() && path.as_str() != "system")
+            .cloned();
+        let (ssl_mode, verify) = match taken.get("sslmode").map(String::as_str) {
+            Some("disable") => (SslMode::Disable, TlsVerify::None),
+            Some("allow" | "prefer") => (SslMode::Prefer, TlsVerify::None),
+            // libpq: with a root certificate configured, `require` (or no
+            // sslmode at all) behaves like verify-ca.
+            Some("require") if root_cert.is_some() => (SslMode::Require, TlsVerify::Chain),
+            Some("require") => (SslMode::Require, TlsVerify::None),
+            Some("verify-ca") => (SslMode::Require, TlsVerify::Chain),
+            Some("verify-full") => (SslMode::Require, TlsVerify::ChainAndHost),
+            None if root_cert.is_some() => (SslMode::Require, TlsVerify::Chain),
+            None => (SslMode::Prefer, TlsVerify::None),
+            Some(other) => return Err(format!("Unsupported sslmode \"{other}\".")),
+        };
+        Ok(Self {
+            normalized_connection,
+            ssl_mode,
             verify,
+            root_cert,
+        })
+    }
+
+    fn roots(&self) -> Result<RootCertStore, String> {
+        let Some(path) = &self.root_cert else {
+            return Ok(RootCertStore {
+                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+            });
+        };
+        let unreadable =
+            |error: &dyn std::fmt::Display| format!("Could not read sslrootcert {path}: {error}");
+        let mut roots = RootCertStore::empty();
+        for cert in CertificateDer::pem_file_iter(path).map_err(|error| unreadable(&error))? {
+            roots
+                .add(cert.map_err(|error| unreadable(&error))?)
+                .map_err(|error| unreadable(&error))?;
         }
+        if roots.is_empty() {
+            return Err(unreadable(&"no certificates found"));
+        }
+        Ok(roots)
     }
 
     fn connector(&self) -> Result<MakeRustlsConnect, String> {
@@ -681,20 +818,192 @@ impl TlsRequirement {
         let builder = ClientConfig::builder_with_provider(Arc::clone(&provider))
             .with_safe_default_protocol_versions()
             .map_err(|error| format!("Could not configure TLS: {error}"))?;
-        let config = if self.verify {
-            // verify-ca is treated as verify-full: rustls always checks the
-            // host name, and being stricter than asked fails safe.
-            let roots = RootCertStore {
-                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-            };
-            builder.with_root_certificates(roots).with_no_client_auth()
-        } else {
-            builder
+        let config = match self.verify {
+            TlsVerify::ChainAndHost => builder
+                .with_root_certificates(self.roots()?)
+                .with_no_client_auth(),
+            TlsVerify::Chain => {
+                let inner = WebPkiServerVerifier::builder_with_provider(
+                    Arc::new(self.roots()?),
+                    Arc::clone(&provider),
+                )
+                .build()
+                .map_err(|error| format!("Could not configure TLS: {error}"))?;
+                builder
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(ChainOnlyVerifier { inner }))
+                    .with_no_client_auth()
+            }
+            TlsVerify::None => builder
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(EncryptOnlyVerifier { provider }))
-                .with_no_client_auth()
+                .with_no_client_auth(),
         };
         Ok(MakeRustlsConnect::new(config))
+    }
+}
+
+/// Remove the named parameters from a libpq connection string, in either the
+/// URI form (`postgresql://…?sslmode=require`) or the key/value form
+/// (`host=h sslmode='require'`), returning the rest and the removed values.
+/// A string this cannot parse is returned unchanged, so tokio-postgres reports
+/// the syntax error.
+fn take_connection_params(connection: &str, names: &[&str]) -> (String, HashMap<String, String>) {
+    let mut taken = HashMap::new();
+    if connection.starts_with("postgres://") || connection.starts_with("postgresql://") {
+        let Some((base, query)) = connection.split_once('?') else {
+            return (connection.to_string(), taken);
+        };
+        let kept: Vec<&str> = query
+            .split('&')
+            .filter(|pair| {
+                let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                let key = percent_decode(key);
+                if names.contains(&key.as_str()) {
+                    taken.insert(key, percent_decode(value));
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+        let normalized = if kept.is_empty() {
+            base.to_string()
+        } else {
+            format!("{base}?{}", kept.join("&"))
+        };
+        return (normalized, taken);
+    }
+    let Some(pairs) = parse_key_value_pairs(connection) else {
+        return (connection.to_string(), taken);
+    };
+    let mut kept = Vec::new();
+    for (key, value, span) in pairs {
+        if names.contains(&key.as_str()) {
+            taken.insert(key, value);
+        } else {
+            kept.push(&connection[span]);
+        }
+    }
+    (kept.join(" "), taken)
+}
+
+/// libpq key/value pairs with each pair's byte span in the input: values may
+/// be single-quoted, and a backslash escapes the next character.
+fn parse_key_value_pairs(input: &str) -> Option<Vec<(String, String, std::ops::Range<usize>)>> {
+    let mut pairs = Vec::new();
+    let mut chars = input.char_indices().peekable();
+    let skip_whitespace = |chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>| {
+        while chars.next_if(|(_, c)| c.is_whitespace()).is_some() {}
+    };
+    loop {
+        skip_whitespace(&mut chars);
+        let Some(&(start, _)) = chars.peek() else {
+            return Some(pairs);
+        };
+        let mut key = String::new();
+        while let Some((_, c)) = chars.next_if(|(_, c)| *c != '=' && !c.is_whitespace()) {
+            key.push(c);
+        }
+        skip_whitespace(&mut chars);
+        chars.next_if(|(_, c)| *c == '=')?;
+        skip_whitespace(&mut chars);
+        let mut value = String::new();
+        let quoted = chars.next_if(|(_, c)| *c == '\'').is_some();
+        let end = loop {
+            let Some((index, c)) = chars.next() else {
+                if quoted {
+                    return None;
+                }
+                break input.len();
+            };
+            match c {
+                '\\' => value.push(chars.next()?.1),
+                '\'' if quoted => break index + 1,
+                c if !quoted && c.is_whitespace() => break index,
+                c => value.push(c),
+            }
+        };
+        if key.is_empty() {
+            return None;
+        }
+        pairs.push((key, value, start..end));
+    }
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let hex = bytes
+            .get(index + 1..index + 3)
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match (bytes[index], hex) {
+            (b'%', Some(byte)) => {
+                decoded.push(byte);
+                index += 3;
+            }
+            (byte, _) => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+/// libpq `sslmode=verify-ca`: the chain must lead to a trusted root, but the
+/// host name is not checked (common for servers reached by IP address).
+#[derive(Debug)]
+struct ChainOnlyVerifier {
+    inner: Arc<WebPkiServerVerifier>,
+}
+
+impl ServerCertVerifier for ChainOnlyVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        match self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        ) {
+            Err(rustls::Error::InvalidCertificate(
+                CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. },
+            )) => Ok(ServerCertVerified::assertion()),
+            result => result,
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
     }
 }
 
@@ -826,14 +1135,67 @@ mod tests {
 
     #[test]
     fn maps_libpq_sslmodes() {
-        let require = TlsRequirement::from_connection_string("postgres://h/db?sslmode=require");
-        assert!(!require.verify);
-        let full = TlsRequirement::from_connection_string("host=h sslmode=verify-full");
-        assert!(full.verify);
-        assert_eq!(full.normalized_connection, "host=h sslmode=require");
-        let ca = TlsRequirement::from_connection_string("postgres://h/db?sslmode=verify-ca");
-        assert!(ca.verify);
+        let tls = |connection| TlsRequirement::from_connection_string(connection).unwrap();
+        let require = tls("postgres://h/db?sslmode=require");
+        assert_eq!(require.verify, TlsVerify::None);
+        assert_eq!(require.ssl_mode, SslMode::Require);
+        assert_eq!(require.normalized_connection, "postgres://h/db");
+
+        let full = tls("host=h sslmode=verify-full");
+        assert_eq!(full.verify, TlsVerify::ChainAndHost);
+        assert_eq!(full.normalized_connection, "host=h");
+
+        let ca = tls("postgres://h/db?application_name=x&sslmode=verify-ca");
+        assert_eq!(ca.verify, TlsVerify::Chain);
+        assert_eq!(
+            ca.normalized_connection,
+            "postgres://h/db?application_name=x"
+        );
         assert!(tokio_postgres::Config::from_str(&ca.normalized_connection).is_ok());
+
+        let default = tls("host=h dbname=gis");
+        assert_eq!(default.ssl_mode, SslMode::Prefer);
+        assert_eq!(default.verify, TlsVerify::None);
+
+        assert!(TlsRequirement::from_connection_string("host=h sslmode=bogus").is_err());
+    }
+
+    #[test]
+    fn parses_ssl_params_like_libpq() {
+        // Quoted, spaced and escaped forms are found ...
+        let tls = TlsRequirement::from_connection_string(
+            "host=h sslmode = 'verify-full' password='it\\'s' sslrootcert='/certs/my ca.pem'",
+        )
+        .unwrap();
+        assert_eq!(tls.verify, TlsVerify::ChainAndHost);
+        assert_eq!(tls.root_cert.as_deref(), Some("/certs/my ca.pem"));
+        assert_eq!(tls.normalized_connection, "host=h password='it\\'s'");
+
+        // ... and text inside another value that only looks like one is not.
+        let decoy = TlsRequirement::from_connection_string(
+            "host=h password='sslmode=verify-full' sslmode=require",
+        )
+        .unwrap();
+        assert_eq!(decoy.verify, TlsVerify::None);
+        assert_eq!(
+            decoy.normalized_connection,
+            "host=h password='sslmode=verify-full'"
+        );
+
+        let uri = TlsRequirement::from_connection_string(
+            "postgresql://u:p@h/db?password=sslmode%3Dverify-full&sslrootcert=%2Fca.pem",
+        )
+        .unwrap();
+        // A root certificate without an sslmode verifies the chain, as libpq does.
+        assert_eq!(uri.verify, TlsVerify::Chain);
+        assert_eq!(uri.root_cert.as_deref(), Some("/ca.pem"));
+        assert_eq!(
+            uri.normalized_connection,
+            "postgresql://u:p@h/db?password=sslmode%3Dverify-full"
+        );
+
+        let system = TlsRequirement::from_connection_string("host=h sslrootcert=system").unwrap();
+        assert_eq!(system.root_cert, None);
     }
 
     fn key() -> SourceKey {
@@ -841,6 +1203,7 @@ mod tests {
             schema: "public".into(),
             table: "roads".into(),
             geometry_column: "geom".into(),
+            default_srid: None,
         }
     }
 

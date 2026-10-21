@@ -1,14 +1,16 @@
+import { useAppStore } from "@geolibre/core";
 import { Button, Input, Label, Select } from "@geolibre/ui";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
+  disconnectPostgisTiles,
   listPostgisTileSources,
   readPostgisTileSourceInfo,
   registerPostgisTilesProtocol,
   rememberPostgisTilesConnection,
   type PostgisTileSource,
 } from "../../../../lib/postgis-tiles";
-import { postgisTilesUrl } from "../../../../lib/postgis-tiles-url";
+import { postgisTilesConnectionLabels, postgisTilesUrl } from "../../../../lib/postgis-tiles-url";
 import {
   createBaseLayer,
   errorMessage,
@@ -68,6 +70,23 @@ export function PostgresNativeSource({ initialPostgres }: PostgresNativeSourcePr
     initialPostgres?.table
       ? { schema: initialPostgres.schema, table: initialPostgres.table }
       : null,
+  );
+
+  // Closing the form without adding a layer leaves a pool no layer uses;
+  // close it rather than wait for eviction.
+  const connectedRef = useRef(connected);
+  useEffect(() => {
+    connectedRef.current = connected;
+  }, [connected]);
+  useEffect(
+    () => () => {
+      const last = connectedRef.current;
+      if (!last) return;
+      const label = savedPostgresConnectionLabel(last.connection);
+      if (postgisTilesConnectionLabels(useAppStore.getState().layers).has(label)) return;
+      void disconnectPostgisTiles(last.connection).catch(() => {});
+    },
+    [],
   );
 
   const resetConnection = () => {

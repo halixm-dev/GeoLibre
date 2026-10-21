@@ -79,3 +79,17 @@ function parseTileCoordinate(value: string): number {
   }
   return parsed;
 }
+
+/** The masked connection labels that the given layers' PostGIS tiles use. */
+export function postgisTilesConnectionLabels(
+  layers: ReadonlyArray<{ metadata?: Record<string, unknown> }>,
+): Set<string> {
+  const labels = new Set<string>();
+  for (const { metadata } of layers) {
+    const label = metadata?.postgisConnectionLabel;
+    if (metadata?.sourceKind === "postgis-tiles" && typeof label === "string" && label) {
+      labels.add(label);
+    }
+  }
+  return labels;
+}

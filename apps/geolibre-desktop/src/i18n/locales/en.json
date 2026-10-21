@@ -1051,7 +1051,7 @@
       "statusTablesFound_other": "Found {{count}} spatial tables.",
       "statusNoTables": "No spatial tables were found in this database.",
       "editableTable": "Table",
-      "nativeTilesNotice": "Loads read-only vector tiles rendered by the database (PostGIS 3.0 or later). This device connects to PostgreSQL directly, so the server must be reachable from its network. Editable layers need GeoLibre Desktop.",
+      "nativeTilesNotice": "Loads read-only vector tiles rendered by the database (PostGIS 3.0 or later). This device connects to PostgreSQL directly, so the server must be reachable from its network. Editable layers need GeoLibre Desktop. The connection is encrypted when the server supports it, but the server certificate is only checked with sslmode=verify-ca or verify-full.",
       "geometryColumn": "Geometry column",
       "tableReadOnly": "{{table}} (read-only: no primary key)",
       "errorSelectTable": "Select a table to load.",

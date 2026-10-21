@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   parsePostgisTileUrl,
+  postgisTilesConnectionLabels,
   postgisTilesUrl,
 } from "../apps/geolibre-desktop/src/lib/postgis-tiles-url";
 
@@ -49,5 +50,20 @@ describe("parsePostgisTileUrl", () => {
     assert.throws(() => parsePostgisTileUrl(expand(postgisTilesUrl(source), 1, 0.5, 0)));
     assert.throws(() => parsePostgisTileUrl(good.replace(/&geom=[^&]*/, "")));
     assert.throws(() => parsePostgisTileUrl("geolibre-pgtiles://tile/1/0?conn=a"));
+  });
+});
+
+describe("postgisTilesConnectionLabels", () => {
+  it("collects the connection labels of native PostGIS tile layers only", () => {
+    const labels = postgisTilesConnectionLabels([
+      { metadata: { sourceKind: "postgis-tiles", postgisConnectionLabel: "a" } },
+      { metadata: { sourceKind: "postgis-tiles", postgisConnectionLabel: "a" } },
+      { metadata: { sourceKind: "postgis-tiles", postgisConnectionLabel: "b" } },
+      // An editable PostGIS layer carries a label too, but holds no tile pool.
+      { metadata: { postgisConnectionLabel: "c" } },
+      { metadata: { sourceKind: "postgis-tiles" } },
+      {},
+    ]);
+    assert.deepEqual([...labels], ["a", "b"]);
   });
 });

@@ -44,6 +44,13 @@ PostgreSQL connection. The database server must therefore be reachable from
 the device's network. Mobile layers are read-only: the editable mode needs the
 desktop app's Python sidecar.
 
+TLS follows libpq's `sslmode`: `prefer` (the default) and `require` encrypt
+without checking the server certificate, `verify-ca` checks the chain and
+`verify-full` also the host name, against the bundled public roots or the PEM
+file named by `sslrootcert`. Connections through PgBouncer and hosted poolers
+work: the 30-second query timeout is set after connecting, not as a startup
+parameter.
+
 The database sources have one entry point that check does not cover: the Browser
 panel keeps its **Databases** section on every platform for discovery, so its ＋
 still opens the connection dialog. The SQL Server dialog gates on

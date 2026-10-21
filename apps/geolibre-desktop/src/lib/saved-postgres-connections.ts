@@ -351,6 +351,13 @@ export function savedPostgresConnectionLabel(connectionString: string): string {
   try {
     const url = new URL(connectionString);
     if (url.password) url.password = "****";
+    // libpq URIs also take the password as a query parameter. Only rewrite
+    // the query when one is present: re-serializing it can change unrelated
+    // escapes, and the label is a lookup key persisted in projects.
+    const secretKeys = [...url.searchParams.keys()].filter((key) =>
+      /^(password|sslpassword)$/i.test(key),
+    );
+    for (const key of secretKeys) url.searchParams.set(key, "****");
     return url.toString();
   } catch {
     return connectionString

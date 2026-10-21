@@ -16,10 +16,18 @@ import {
   parsePostgisTileUrl,
   type PostgisTileSourceRef,
 } from "./postgis-tiles-url";
+import { createRequestLimiter, type RequestLimiter } from "./request-limiter";
 import {
   readSavedPostgresConnections,
   savedPostgresConnectionLabel,
 } from "./saved-postgres-connections";
+
+/**
+ * Tile requests sent to the backend at once per connection: its pool size
+ * (`POOL_SIZE` in `postgis_tiles.rs`). The rest wait here, where a tile
+ * MapLibre cancels can still be dropped; once sent, a request cannot be.
+ */
+const MAX_TILES_IN_FLIGHT = 4;
 
 export interface PostgisTileSource {
   schema: string;
@@ -37,15 +45,25 @@ export interface PostgisTileSourceInfo {
   fields: Record<string, string>;
 }
 
-/** Connection strings used this session, by masked label. */
+/**
+ * Connection strings used this session, by masked label. Two strings that
+ * differ only by password share a label; the later, which has just connected
+ * successfully, replaces the stale one.
+ */
 const sessionConnections = new Map<string, string>();
+
+const tileLimiters = new Map<string, RequestLimiter>();
 
 let protocolRegistered = false;
 
 /** Remember a connection so its tile URLs resolve without a saved entry. */
 export function rememberPostgisTilesConnection(connection: string): string {
   const label = savedPostgresConnectionLabel(connection);
+  const replaced = sessionConnections.get(label);
   sessionConnections.set(label, connection);
+  // A replaced string (e.g. an old password) can no longer be resolved from
+  // a tile URL, so its pool would only sit idle.
+  if (replaced && replaced !== connection) void disconnectPostgisTiles(replaced).catch(() => {});
   return label;
 }
 
@@ -91,9 +109,38 @@ export function disconnectPostgisTiles(connection?: string): Promise<void> {
   return invoke("postgis_tiles_disconnect", { connection: connection ?? null });
 }
 
+/**
+ * Close the pools behind connection labels no layer uses any more (the last
+ * layer of a database was removed, or the project was closed).
+ */
+export function releasePostgisTilesConnections(labels: Iterable<string>): void {
+  for (const label of labels) {
+    tileLimiters.delete(label);
+    const candidates = new Set(
+      readSavedPostgresConnections().filter(
+        (connection) => savedPostgresConnectionLabel(connection) === label,
+      ),
+    );
+    const session = sessionConnections.get(label);
+    if (session) candidates.add(session);
+    for (const connection of candidates) {
+      void disconnectPostgisTiles(connection).catch(() => {});
+    }
+  }
+}
+
+function tileLimiter(label: string): RequestLimiter {
+  let limiter = tileLimiters.get(label);
+  if (!limiter) {
+    limiter = createRequestLimiter(MAX_TILES_IN_FLIGHT);
+    tileLimiters.set(label, limiter);
+  }
+  return limiter;
+}
+
 export function registerPostgisTilesProtocol(): void {
   if (protocolRegistered) return;
-  addProtocol(POSTGIS_TILES_PROTOCOL, async (request) => {
+  addProtocol(POSTGIS_TILES_PROTOCOL, async (request, abortController) => {
     const tile = parsePostgisTileUrl(request.url);
     const connection = resolvePostgisTilesConnection(tile.connectionLabel);
     if (!connection) {
@@ -103,16 +150,20 @@ export function registerPostgisTilesProtocol(): void {
     }
     // The command returns a raw tauri::ipc::Response, which arrives as an
     // ArrayBuffer rather than a JSON number array.
-    const data = await invoke<ArrayBuffer>("postgis_tiles_tile", {
-      connection,
-      defaultSrid: tile.defaultSrid ?? null,
-      schema: tile.schema,
-      table: tile.table,
-      geometryColumn: tile.geometryColumn,
-      z: tile.z,
-      x: tile.x,
-      y: tile.y,
-    });
+    const data = await tileLimiter(tile.connectionLabel)(
+      () =>
+        invoke<ArrayBuffer>("postgis_tiles_tile", {
+          connection,
+          defaultSrid: tile.defaultSrid ?? null,
+          schema: tile.schema,
+          table: tile.table,
+          geometryColumn: tile.geometryColumn,
+          z: tile.z,
+          x: tile.x,
+          y: tile.y,
+        }),
+      abortController.signal,
+    );
     return { data };
   });
   protocolRegistered = true;

@@ -427,6 +427,20 @@ describe("savedPostgresConnectionLabel", () => {
     );
   });
 
+  it("masks a password passed as a URI query parameter", () => {
+    assert.equal(
+      savedPostgresConnectionLabel(
+        "postgresql://gis@db.example.com/city?sslmode=require&password=secret&SSLPassword=key",
+      ),
+      "postgresql://gis@db.example.com/city?sslmode=require&password=****&SSLPassword=****",
+    );
+  });
+
+  it("leaves a URI query without a password untouched", () => {
+    const connection = "postgresql://gis@db.example.com/city?options=-c%20search_path%3Dgis";
+    assert.equal(savedPostgresConnectionLabel(connection), connection);
+  });
+
   it("masks the password in a keyword connection string", () => {
     assert.equal(
       savedPostgresConnectionLabel("host=localhost password=secret dbname=db"),
